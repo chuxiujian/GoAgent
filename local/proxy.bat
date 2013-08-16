@@ -1,1 +1,1 @@
-@start "GoAgent" "%~dp0python33.exe" "%~dp0proxy.py" || pause
+@start "GoAgent" "C:\Python32\python.exe" "%~dp0proxy.py" || pause
