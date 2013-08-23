@@ -1107,6 +1107,7 @@ class Common(object):
         self.PAC_PORT = self.CONFIG.getint('pac', 'port')
         self.PAC_FILE = self.CONFIG.get('pac', 'file').lstrip('/')
         self.PAC_GFWLIST = self.CONFIG.get('pac', 'gfwlist')
+        self.PAC_URLFITER = self.CONFIG.get('pac', 'urlfiter')
         self.PAC_EXPIRED = self.CONFIG.getint('pac', 'expired')
 
         self.PAAS_ENABLE = self.CONFIG.getint('paas', 'enable')
@@ -2066,46 +2067,46 @@ class PAASProxyHandler(GAEProxyHandler):
 def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
     """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
     jsCode = []
-    # Filter options (those parts start with "$") is not supported
     for line in content.splitlines()[1:]:
-        # Ignore the first line ([AutoProxy x.x]), empty lines and comments
         if line and not line.startswith("!"):
             use_proxy = True
-            # Exceptions
             if line.startswith("@@"):
                 line = line[2:]
                 use_proxy = False
-            # Regular expressions
-            if line.startswith("/") and line.endswith("/"):
-                jsRegexp = line[1:-1]
-            # Other cases
+            return_proxy = 'PROXY %s' % proxy if use_proxy else default
+            if line.startswith('/') and line.endswith('/'):
+                jsLine = 'if (/%s/i.test(url)) return "%s";' % (line[1:-1], return_proxy)
+            elif line.startswith('||'):
+                jsLine = 'if (dnsDomainIs(host, ".%s")) return "%s";' % (line[2:], return_proxy)
+            elif line.startswith('|'):
+                jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line[1:], return_proxy)
+            elif '*' in line:
+                jsLine = 'if (shExpMatch(url, "*%s*")) return "%s";' % (line.strip('*'), return_proxy)
+            elif '/' not in line:
+                jsLine = 'if (host.indexOf("%s") >= 0) return "%s";' % (line, return_proxy)
             else:
-                # Remove multiple wildcards
-                jsRegexp = re.sub(r"\*+", r"*", line)
-                # Remove anchors following separator placeholder
-                jsRegexp = re.sub(r"\^\|$", r"^", jsRegexp, 1)
-                # Escape special symbols
-                jsRegexp = re.sub(r"(\W)", r"\\\1", jsRegexp)
-                # Replace wildcards by .*
-                jsRegexp = re.sub(r"\\\*", r".*", jsRegexp)
-                # Process separator placeholders
-                jsRegexp = re.sub(r"\\\^", r"(?:[^\w\-.%\u0080-\uFFFF]|$)", jsRegexp)
-                # Process extended anchor at expression start
-                #jsRegexp = re.sub(r"^\\\|\\\|", r"^[\w\-]+:\/+(?!\/)(?:[^\/]+\.)?", jsRegexp, 1)
-                jsRegexp = re.sub(r"^\\\|\\\|", r"^https?:\/\/(?:\w+\.)?", jsRegexp, 1)
-                # Process anchor at expression start
-                jsRegexp = re.sub(r"^\\\|", "^", jsRegexp, 1)
-                # Process anchor at expression end
-                jsRegexp = re.sub(r"\\\|$", "$", jsRegexp, 1)
-                # Remove leading wildcards
-                jsRegexp = re.sub(r"^(\.\*)", "", jsRegexp, 1)
-                # Remove trailing wildcards
-                jsRegexp = re.sub(r"(\.\*)$", "", jsRegexp, 1)
-                if jsRegexp == "":
-                    jsRegexp = ".*"
-                    logging.warning("There is one rule that matches all URL, which is highly *NOT* recommended: %s", line)
-            jsLine = 'if(/%s/i.test(url)) return "%s";' % (jsRegexp, 'PROXY %s' % proxy if use_proxy else default)
-            jsLine = ' '*indent + jsLine
+                jsLine = 'if (url.indexOf("%s") >= 0) return "%s";' % (line, return_proxy)
+            jsLine = ' ' * indent + jsLine
+            if use_proxy:
+                jsCode.append(jsLine)
+            else:
+                jsCode.insert(0, jsLine)
+    function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsCode), ' '*indent, default)
+    return function
+
+
+def urlfiter2pac(content, func_name='FindProxyForURLByUrlfiter', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+    """urlfiter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+    jsCode = []
+    for line in content[content.index('[exclude]'):].splitlines()[1:]:
+        if line and not line.startswith(';'):
+            use_proxy = True
+            if line.startswith("@@"):
+                line = line[2:]
+                use_proxy = False
+            return_proxy = 'PROXY %s' % proxy if use_proxy else default
+            jsLine = 'if(shExpMatch(url, "%s")) return "%s";' % (line, return_proxy)
+            jsLine = ' ' * indent + jsLine
             if use_proxy:
                 jsCode.append(jsLine)
             else:
@@ -2168,38 +2169,47 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         proxy = '%s:%s' % (ProxyUtil.get_listen_ip() if common.LISTEN_IP in ('', '::', '0.0.0.0') else common.LISTEN_IP, common.LISTEN_PORT)
         pacproxy = '%s:%s' % (ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP, common.PAC_PORT)
         default = '%s:%s' % (common.PROXY_HOST, common.PROXY_PORT) if common.PROXY_ENABLE else 'DIRECT'
+        opener = urllib2.build_opener(urllib2.ProxyHandler({'http': proxy, 'https': proxy}))
+        content = ''
+        with open(filename, 'rb') as fp:
+            content = fp.read()
         try:
-            logging.info('try download %r to update_pacfile(%r)', common.PAC_GFWLIST, filename)
-            opener = urllib2.build_opener(urllib2.ProxyHandler({'http': proxy, 'https': proxy}))
-            response = opener.open(common.PAC_GFWLIST)
-            content = response.read()
-            response.close()
-            content = base64.b64decode(content)
-            logging.info('%r downloaded, try convert it with autoproxy2pac', common.PAC_GFWLIST)
+            placeholder = '// AUTO-GENERATED RULES, DO NOT MODIFY!'
+            content = content[:content.index(placeholder)+len(placeholder)]
+            content = re.sub(r'''blackhole\s*=\s*['"]PROXY [\.\w:]+['"]''', 'blackhole = \'PROXY %s\'' % pacproxy, content)
+            content = re.sub(r'''goagent\s*=\s*['"]PROXY [\.\w:]+['"]''', 'goagent = \'PROXY %s\'' % proxy, content)
+            if content.startswith('//'):
+                line = '// Proxy Auto-Config file generated by autoproxy2pac, %s\r\n' % time.strftime('%Y-%m-%d %H:%M:%S')
+                content = line + '\r\n'.join(content.splitlines()[1:])
+        except ValueError:
+            pass
+        try:
+            logging.info('try download %r to update_pacfile(%r)', common.PAC_URLFITER, filename)
+            urlfiter_content = opener.open(common.PAC_URLFITER).read()
+            logging.info('%r downloaded, try convert it with urlfiter2pac', common.PAC_URLFITER)
             if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
-                jsrule = gevent.get_hub().threadpool.apply(autoproxy2pac, (content, 'FindProxyForURLByAutoProxy', proxy, default))
+                jsrule = gevent.get_hub().threadpool.apply(urlfiter2pac, (urlfiter_content, 'FindProxyForURLByUrlfiter', pacproxy, default))
             else:
-                jsrule = autoproxy2pac(content, 'FindProxyForURLByAutoProxy', proxy, default)
-            logging.info('%r parsed, try write it to %r', common.PAC_GFWLIST, filename)
-            content = ''
-            if os.path.isfile(filename):
-                with open(filename, 'rb') as fp:
-                    content = fp.read()
-            try:
-                placeholder = '// AUTO-GENERATED RULES, DO NOT MODIFY!'
-                content = content[:content.index(placeholder)+len(placeholder)]
-                content = re.sub(r'''blackhole\s*=\s*['"]PROXY [\.\w:]+['"]''', 'blackhole = \'PROXY %s\'' % pacproxy, content)
-                content = re.sub(r'''goagent\s*=\s*['"]PROXY [\.\w:]+['"]''', 'goagent = \'PROXY %s\'' % proxy, content)
-                if content.startswith('//'):
-                    line = '// Proxy Auto-Config file generated by autoproxy2pac, %s\r\n' % time.strftime('%Y-%m-%d %H:%M:%S')
-                    content = line + '\r\n'.join(content.splitlines()[1:])
-            except ValueError:
-                pass
-            with open(filename, 'wb') as fp:
-                fp.write(content + '\r\n' + jsrule)
-            logging.info('update %r successfully', filename)
+                jsrule = urlfiter2pac(urlfiter_content, 'FindProxyForURLByUrlfiter', pacproxy, default)
+            content += '\r\n' + jsrule + '\r\n'
+            logging.info('%r downloaded and parsed', common.PAC_URLFITER)
         except Exception as e:
             logging.exception('update_pacfile failed: %r', e)
+        try:
+            logging.info('try download %r to update_pacfile(%r)', common.PAC_GFWLIST, filename)
+            autoproxy_content = base64.b64decode(opener.open(common.PAC_GFWLIST).read())
+            logging.info('%r downloaded, try convert it with autoproxy2pac', common.PAC_GFWLIST)
+            if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
+                jsrule = gevent.get_hub().threadpool.apply(autoproxy2pac, (autoproxy_content, 'FindProxyForURLByAutoProxy', proxy, default))
+            else:
+                jsrule = autoproxy2pac(autoproxy_content, 'FindProxyForURLByAutoProxy', proxy, default)
+            content += '\r\n' + jsrule + '\r\n'
+            logging.info('%r downloaded and parsed', common.PAC_GFWLIST)
+        except Exception as e:
+            logging.exception('update_pacfile failed: %r', e)
+        with open(filename, 'wb') as fp:
+            fp.write(content)
+        logging.info('%r successfully updated', filename)
 
 
 class DNSServer(SocketServer.ThreadingUDPServer):
@@ -2280,7 +2290,8 @@ def pre_start():
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
     if common.PAC_ENABLE:
-        url = 'http://%s:%d/%s' % (common.PAC_IP, common.PAC_PORT, common.PAC_FILE)
+        pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
+        url = 'http://%s:%d/%s' % (pac_ip, common.PAC_PORT, common.PAC_FILE)
         spawn_later(600, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
     if common.PAAS_ENABLE:
         if common.PAAS_FETCHSERVER.startswith('http://') and not common.PAAS_PASSWORD:
