@@ -66,6 +66,7 @@ except ImportError:
     OpenSSL = None
 
 
+HAS_PYPY = hasattr(sys, 'pypy_version_info')
 NetWorkIOError = (socket.error, ssl.SSLError, OSError) if not OpenSSL else (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
 
 
@@ -520,10 +521,10 @@ class PacUtil(object):
                 if line.startswith('/') and line.endswith('/'):
                     jsLine = 'if (/%s/i.test(url)) return "%s";' % (line[1:-1], return_proxy)
                 elif line.startswith('||'):
-                    domain = line[2:]
+                    domain = line[2:].lstrip('.')
                     if 'host.indexOf(".%s") >= 0' % domain in jsLines[-1] or 'host.indexOf("%s") >= 0' % domain in jsLines[-1]:
                         jsLines.pop()
-                    jsLine = 'if (dnsDomainIs(host, "%s")) return "%s";' % (domain, return_proxy)
+                    jsLine = 'if (dnsDomainIs(host, ".%s") || host == "%s") return "%s";' % (domain, domain, return_proxy)
                 elif line.startswith('|'):
                     jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line[1:], return_proxy)
                 elif '*' in line:
@@ -1370,6 +1371,13 @@ def message_html(title, banner, detail=''):
     return string.Template(MESSAGE_TEMPLATE).substitute(title=title, banner=banner, detail=detail)
 
 
+def response_replace_header(response, name, value):
+    if sys.hexversion < 0x3000000:
+        response.msg[name] = value
+    else:
+        response.header.replace_header(name, value)
+
+
 def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     # deflate = lambda x:zlib.compress(x)[2:-4]
     if payload:
@@ -1729,6 +1737,8 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         return '%s:%s' % self.client_address[:2]
 
     def do_METHOD(self):
+        if HAS_PYPY:
+            self.path = re.sub(r'(://[^/]+):\d+/', '\\1/', self.path)
         host = self.headers.get('Host', '')
         if self.path[0] == '/' and host:
             self.path = 'http://%s%s' % (host, self.path)
@@ -1780,7 +1790,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
             if response.status in (400, 405):
                 common.GAE_CRLF = 0
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k != 'Transfer-Encoding'))))
+            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
             while 1:
                 data = response.read(8192)
                 if not data:
@@ -1887,7 +1897,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     continue
                 if response.app_status != 200 and retry == common.FETCHMAX_LOCAL-1:
                     logging.info('%s "GAE %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-                    self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k != 'Transfer-Encoding'))))
+                    self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
                     self.wfile.write(response.read())
                     response.close()
                     return
@@ -1899,9 +1909,9 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         rangefetch = RangeFetch(self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
                         return rangefetch.fetch()
                     if response.getheader('Set-Cookie'):
-                        response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
+                        response_replace_header(response, 'Set-Cookie', self.normcookie(response.getheader('Set-Cookie')))
                     if response.getheader('Content-Disposition') and '"' not in response.getheader('Content-Disposition'):
-                        response.msg['Content-Disposition'] = self.normattachment(response.getheader('Content-Disposition'))
+                        response_replace_header(response, 'Content-Disposition', self.normattachment(response.getheader('Content-Disposition')))
                     headers_data = 'HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
                     logging.debug('headers_data=%s', headers_data)
                     #self.wfile.write(headers_data.encode() if bytes is not str else headers_data)
@@ -2174,7 +2184,7 @@ class PAASProxyHandler(GAEProxyHandler):
                 http_util.crlf = 0
 
             if response.getheader('Set-Cookie'):
-                response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
+                response_replace_header(response, 'Set-Cookie', self.normcookie(response.getheader('Set-Cookie')))
             self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
 
             while 1:
@@ -2218,9 +2228,9 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 mimetype = 'application/octet-stream'
             if self.path.endswith('.pac?flush'):
                 thread.start_new_thread(PacUtil.update_pacfile, args=(self.pacfile,))
-            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
+            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED or os.path.getsize(self.pacfile) < 4 * 1024:
                 os.utime(filename, (time.time(), time.time()))
-                if time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
+                if time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED or os.path.getsize(self.pacfile) < 4 * 1024:
                     thread.start_new_thread(PacUtil.update_pacfile, args=(self.pacfile,))
                 else:
                     logging.info('%r is updating by other thread, ignore', filename)
@@ -2319,7 +2329,7 @@ def pre_start():
     if common.PAC_ENABLE:
         pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
         url = 'http://%s:%d/%s' % (pac_ip, common.PAC_PORT, common.PAC_FILE)
-        spawn_later(600, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
+        spawn_later(5, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
     if common.PAAS_ENABLE:
         if common.PAAS_FETCHSERVER.startswith('http://') and not common.PAAS_PASSWORD:
             logging.warning('Dont forget set your PAAS fetchserver password or use https')
