@@ -855,6 +855,8 @@ class HTTPUtil(object):
         self.ssl_obfuscate = ssl_obfuscate or self.ssl_obfuscate
         if self.ssl_validate or self.ssl_obfuscate:
             self.ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+            if hasattr(OpenSSL.SSL, 'SESS_CACHE_BOTH'):
+                self.ssl_context.set_session_cache_mode(OpenSSL.SSL.SESS_CACHE_BOTH)
         else:
             self.ssl_context = None
         if self.ssl_validate:
@@ -2112,15 +2114,16 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.__realconnection = None
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
         try:
-            if not http_util.ssl_validate and not http_util.ssl_obfuscate:
-                ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
-            else:
-                ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
-                ssl_context.use_privatekey_file(certfile)
-                ssl_context.use_certificate_file(certfile)
-                ssl_sock = SSLConnection(ssl_context, self.connection)
-                ssl_sock.set_accept_state()
-                ssl_sock.do_handshake()
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            # if not http_util.ssl_validate and not http_util.ssl_obfuscate:
+            #     ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            # else:
+            #     ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+            #     ssl_context.use_privatekey_file(certfile)
+            #     ssl_context.use_certificate_file(certfile)
+            #     ssl_sock = SSLConnection(ssl_context, self.connection)
+            #     ssl_sock.set_accept_state()
+            #     ssl_sock.do_handshake()
         except Exception as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                 logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
@@ -2312,7 +2315,7 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         filename = os.path.normpath('./' + urlparse.urlparse(self.path).path)
         if self.path.startswith(('http://', 'https://')):
             data = b'HTTP/1.1 200\r\nCache-Control: max-age=86400\r\nExpires:Oct, 01 Aug 2100 00:00:00 GMT\r\nConnection: close\r\n'
-            if self.path.endswith(('.jpg', '.gif', '.jpeg', '.bmp')):
+            if filename.endswith(('.jpg', '.gif', '.jpeg', '.bmp')):
                 data += b'Content-Type: image/gif\r\n\r\n' + self.onepixel
             else:
                 data += b'\r\n'
