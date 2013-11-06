@@ -3,7 +3,7 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '3.0.5'
+__version__ = '3.0.6'
 __password__ = 'pass-gfw'
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
@@ -82,8 +82,81 @@ def message_html(title, banner, detail=''):
     return string.Template(MESSAGE_TEMPLATE).substitute(title=title, banner=banner, detail=detail)
 
 
+def rc4crypt(data, key):
+    """RC4 algorithm"""
+    if not key or not data:
+        return data
+    x = 0
+    box = range(256)
+    for i, y in enumerate(box):
+        x = (x + y + ord(key[i % len(key)])) & 0xff
+        box[i], box[x] = box[x], y
+    x = y = 0
+    out = []
+    out_append = out.append
+    for char in data:
+        x = (x + 1) & 0xff
+        y = (y + box[x]) & 0xff
+        box[x], box[y] = box[y], box[x]
+        out_append(chr(ord(char) ^ box[(box[x] + box[y]) & 0xff]))
+    return ''.join(out)
+
+
+class RC4FileObject(object):
+    """fileobj for rc4"""
+    def __init__(self, stream, key):
+        self.__stream = stream
+        x = 0
+        box = range(256)
+        for i, y in enumerate(box):
+            x = (x + y + ord(key[i % len(key)])) & 0xff
+            box[i], box[x] = box[x], y
+        self.__box = box
+        self.__x = 0
+        self.__y = 0
+
+    def __getattr__(self, attr):
+        if attr not in ('__stream', '__box', '__x', '__y'):
+            return getattr(self.__stream, attr)
+
+    def read(self, size=-1):
+        out = []
+        out_append = out.append
+        x = self.__x
+        y = self.__y
+        box = self.__box
+        data = self.__stream.read(size)
+        for char in data:
+            x = (x + 1) & 0xff
+            y = (y + box[x]) & 0xff
+            box[x], box[y] = box[y], box[x]
+            out_append(chr(ord(char) ^ box[(box[x] + box[y]) & 0xff]))
+        self.__x = x
+        self.__y = y
+        return ''.join(out)
+
+
+try:
+    import Crypto.Cipher.ARC4
+    def rc4crypt(data, key):
+        return Crypto.Cipher.ARC4.new(key).encrypt(data)
+    class RC4FileObject(object):
+        """fileobj for rc4"""
+        def __init__(self, stream, key):
+            self.__stream = stream
+            self.__cipher = Crypto.Cipher.ARC4.new(key)
+        def __getattr__(self, attr):
+            if attr not in ('__stream', '__cipher'):
+                return getattr(self.__stream, attr)
+        def read(self, size=-1):
+            return self.__cipher.encrypt(self.__stream.read(size))
+except ImportError:
+    pass
+
+
 def gae_application(environ, start_response):
     cookie = environ.get('HTTP_COOKIE', '')
+    options = environ.get('HTTP_X_GOA_OPTIONS', '')
     if environ['REQUEST_METHOD'] == 'GET' and not cookie:
         if '204' in environ['QUERY_STRING']:
             start_response('204 No Content', [])
@@ -98,29 +171,43 @@ def gae_application(environ, start_response):
 
     # inflate = lambda x:zlib.decompress(x, -zlib.MAX_WBITS)
     wsgi_input = environ['wsgi.input']
+    input_data = wsgi_input.read()
     if cookie:
-        metadata = zlib.decompress(base64.b64decode(cookie), -zlib.MAX_WBITS)
+        if 'rc4' not in options:
+            metadata = zlib.decompress(base64.b64decode(cookie), -zlib.MAX_WBITS)
+            payload = input_data or ''
+        else:
+            metadata = zlib.decompress(rc4crypt(base64.b64decode(cookie), __password__), -zlib.MAX_WBITS)
+            payload = rc4crypt(input_data, __password__) if input_data else ''
     else:
-        data = wsgi_input.read(2)
-        metadata_length, = struct.unpack('!h', data)
-        metadata = wsgi_input.read(metadata_length)
-        metadata = zlib.decompress(metadata, -zlib.MAX_WBITS)
+        metadata_length, = struct.unpack('!h', input_data[:2])
+        if 'rc4' not in options:
+            metadata = zlib.decompress(input_data[2:2+metadata_length], -zlib.MAX_WBITS)
+            payload = input_data[2+metadata_length:]
+        else:
+            metadata = rc4crypt(zlib.decompress(input_data[2:2+metadata_length], -zlib.MAX_WBITS), __password__)
+            payload = rc4crypt(input_data[2+metadata_length:], __password__)
 
-    headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
-    method = headers.pop('G-Method')
-    url = headers.pop('G-Url')
+    try:
+        headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
+        method = headers.pop('G-Method')
+        url = headers.pop('G-Url')
+    except KeyError, ValueError:
+        import traceback
+        start_response('500 Internal Server Error', [('Content-Type', 'text/html')])
+        yield message_html('500 Internal Server Error', 'Wrong Request(metadata)', '<pre>%s</pre>' % traceback.format_exc())
+        raise StopIteration
 
     kwargs = {}
     any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
 
-    abbv_headers = {'A': ('Accept', 'text/html, */*; q=0.01'),
-                    'AC': ('Accept-Charset', 'UTF-8,*;q=0.5'),
-                    'AL': ('Accept-Language', 'zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4'),
-                    'AE': ('Accept-Encoding', 'gzip,deflate'), }
-    abbv_args = kwargs.get('abbv', '').split(',')
-    headers.update(v for k, v in abbv_headers.iteritems() if k in abbv_args and v[0] not in headers)
+    if 'Content-Encoding' in headers:
+        if headers['Content-Encoding'] == 'deflate':
+            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
+            headers['Content-Length'] = str(len(payload))
+            del headers['Content-Encoding']
 
-    #logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
+    logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
     #logging.info('request headers=%s', headers)
 
     if __password__ and __password__ != kwargs.get('password', ''):
@@ -149,16 +236,7 @@ def gae_application(environ, start_response):
 
     deadline = URLFETCH_TIMEOUT
     validate_certificate = bool(int(kwargs.get('validate', 0)))
-    headers = dict(headers)
-    payload = wsgi_input.read() if 'Content-Length' in headers else None
-    if 'Content-Encoding' in headers:
-        if headers['Content-Encoding'] == 'deflate':
-            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
-            headers['Content-Length'] = str(len(payload))
-            del headers['Content-Encoding']
-
     accept_encoding = headers.get('Accept-Encoding', '')
-
     errors = []
     for i in xrange(int(kwargs.get('fetchmax', URLFETCH_MAX))):
         try:
@@ -225,9 +303,15 @@ def gae_application(environ, start_response):
     if data:
          response_headers['Content-Length'] = str(len(data))
     response_headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))[2:-4]
-    start_response('200 OK', [('Content-Type', 'image/gif')])
-    yield struct.pack('!hh', int(response.status_code), len(response_headers_data))+response_headers_data
-    yield data
+    if 'rc4' not in options:
+        start_response('200 OK', [('Content-Type', 'image/gif')])
+        yield struct.pack('!hh', int(response.status_code), len(response_headers_data))+response_headers_data
+        yield data
+    else:
+        start_response('200 OK', [('Content-Type', 'image/gif'), ('X-GOA-Options', 'rc4')])
+        yield struct.pack('!hh', int(response.status_code), len(response_headers_data))
+        yield rc4crypt(response_headers_data, __password__)
+        yield rc4crypt(data, __password__)
 
 
 class LegacyHandler(object):
