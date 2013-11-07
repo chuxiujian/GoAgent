@@ -1549,14 +1549,14 @@ class RC4FileObject(object):
 
 
 try:
-    import Crypto.Cipher.ARC4
+    from Crypto.Cipher._ARC4 import new as _Crypto_Cipher_ARC4_new
     def rc4crypt(data, key):
-        return Crypto.Cipher.ARC4.new(key).encrypt(data)
+        return _Crypto_Cipher_ARC4_new(key).encrypt(data)
     class RC4FileObject(object):
         """fileobj for rc4"""
         def __init__(self, stream, key):
             self.__stream = stream
-            self.__cipher = Crypto.Cipher.ARC4.new(key)
+            self.__cipher = _Crypto_Cipher_ARC4_new(key)
         def __getattr__(self, attr):
             if attr not in ('__stream', '__cipher'):
                 return getattr(self.__stream, attr)
@@ -1683,7 +1683,8 @@ class RangeFetch(object):
         range_queue.put((start, end, self.response))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
-        any(thread.start_new_thread(self.__fetchlet, (range_queue, data_queue)) for _ in range(self.threads))
+        for _ in range(self.threads):
+            thread.start_new_thread(self.__fetchlet, (range_queue, data_queue))
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         expect_begin = start
@@ -2592,7 +2593,7 @@ def pre_start():
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
     if common.GOOGLE_MODE == 'http' and common.GAE_PROFILE != 'google_ipv6' and common.GAE_PASSWORD == '':
-        logging.critical('to enable http mode, you should set [gae]password = <your_pass> and [gae]options = rc4', common.CONFIG_FILENAME)
+        logging.critical('to enable http mode, you should set %r [gae]password = <your_pass> and [gae]options = rc4', common.CONFIG_FILENAME)
         sys.exit(-1)
     if common.PAC_ENABLE:
         pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
