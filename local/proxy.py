@@ -1664,10 +1664,12 @@ class RangeFetch(object):
         data_queue = Queue.PriorityQueue()
         range_queue = Queue.PriorityQueue()
         range_queue.put((start, end, self.response))
+        thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, 0))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
-        for _ in range(self.threads):
-            thread.start_new_thread(self.__fetchlet, (range_queue, data_queue))
+        for i in range(1, self.threads):
+            time.sleep(common.AUTORANGE_MAXSIZE / 1048576)
+            thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, i * common.AUTORANGE_MAXSIZE))
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         expect_begin = start
@@ -1705,14 +1707,14 @@ class RangeFetch(object):
                 break
         self._stopped = True
 
-    def __fetchlet(self, range_queue, data_queue):
+    def __fetchlet(self, range_queue, data_queue, range_delay_size):
         headers = dict((k.title(), v) for k, v in self.headers.items())
         headers['Connection'] = 'close'
         while 1:
             try:
                 if self._stopped:
                     return
-                if data_queue.qsize() * self.bufsize > 180*1024*1024:
+                if data_queue.qsize() * self.bufsize + range_delay_size > 30*1024*1024:
                     time.sleep(10)
                     continue
                 try:
@@ -1761,6 +1763,7 @@ class RangeFetch(object):
                             if self._stopped:
                                 response.close()
                                 return
+                            t0 = time.time()
                             data = response.read(self.bufsize)
                             if not data:
                                 break
@@ -1769,6 +1772,9 @@ class RangeFetch(object):
                         except Exception as e:
                             logging.warning('RangeFetch "%s %s" %s failed: %s', self.command, self.url, headers['Range'], e)
                             break
+                    t0 = time.time() - t0
+                    logging.info('>>>>>>>>>>>>>>> Reached {:,} at {:,.0f} KB/s'.format(
+                        start - 1, ((common.AUTORANGE_MAXSIZE+start-end) / t0 / 1024)))
                     if start < end + 1:
                         logging.warning('RangeFetch "%s %s" retry %s-%s', self.command, self.url, start, end)
                         response.close()
