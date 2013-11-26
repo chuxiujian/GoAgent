@@ -917,11 +917,11 @@ class HTTPUtil(object):
 
     def create_connection(self, address, timeout=None, source_address=None, **kwargs):
         connection_cache_key = kwargs.get('cache_key') or address
-        def _create_connection(address, timeout, queobj):
+        def _create_connection(ipaddr, timeout, queobj):
             sock = None
             try:
                 # create a ipv4/ipv6 socket object
-                sock = socket.socket(socket.AF_INET if ':' not in address[0] else socket.AF_INET6)
+                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
                 # set reuseaddr option to avoid 10048 socket error
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 # resize socket recv buffer 8K->32K to improve browser releated application performance
@@ -933,16 +933,16 @@ class HTTPUtil(object):
                 # start connection time record
                 start_time = time.time()
                 # TCP connect
-                sock.connect(address)
+                sock.connect(ipaddr)
                 # record TCP connection time
-                self.tcp_connection_time[address] = time.time() - start_time
+                self.tcp_connection_time[ipaddr] = time.time() - start_time
                 # put ssl socket object to output queobj
                 queobj.put(sock)
             except (socket.error, OSError) as e:
                 # any socket.error, put Excpetions to output queobj.
                 queobj.put(e)
-                # reset a large and random timeout to the address
-                self.tcp_connection_time[address] = self.max_timeout+random.random()
+                # reset a large and random timeout to the ipaddr
+                self.tcp_connection_time[ipaddr] = self.max_timeout+random.random()
                 # close tcp socket
                 if sock:
                     sock.close()
@@ -1018,7 +1018,7 @@ class HTTPUtil(object):
                 # record TCP connection time
                 self.tcp_connection_time[ipaddr] = connected_time - start_time
                 # record SSL connection time
-                self.ssl_connection_time[ipaddr] = handshaked_time - start_time
+                self.ssl_connection_time[ipaddr] = ssl_sock.connection_time = handshaked_time - start_time
                 # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
                 ssl_sock.sock = sock
                 # verify SSL certificate.
@@ -1072,7 +1072,7 @@ class HTTPUtil(object):
                 # record TCP connection time
                 self.tcp_connection_time[ipaddr] = connected_time - start_time
                 # record SSL connection time
-                self.ssl_connection_time[ipaddr] = handshaked_time - start_time
+                self.ssl_connection_time[ipaddr] = ssl_sock.connection_time = handshaked_time - start_time
                 # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
                 ssl_sock.sock = sock
                 # verify SSL certificate.
@@ -1839,6 +1839,11 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     @staticmethod
     def resolve_google_iplist(google_hosts):
+        def do_remote_resolve(name, dnsserver, queue):
+            try:
+                queue.put((name, dnsserver, DNSUtil.remote_resolve(dnsserver, name, timeout=2)))
+            except (socket.error, OSError) as e:
+                logging.error('resolve remote name=%r dnsserver=%r failed: %s', name, dnsserver, e)
         resolved_iplist = []
         need_resolve_remote = []
         for host in google_hosts:
@@ -1853,19 +1858,23 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     need_resolve_remote += [host]
             except (socket.error, OSError):
                 need_resolve_remote += [host]
-        if len(resolved_iplist) < 20 or len(set(x.split('.', 1)[0] for x in resolved_iplist)) == 1:
+        if len(resolved_iplist) < 32 or len(set(x.split('.', 1)[0] for x in resolved_iplist)) == 1:
             logging.warning('local google_hosts=%s is too short, try remote_resolve', google_hosts)
             need_resolve_remote += [x for x in google_hosts if not re.match(r'\d+\.\d+\.\d+\.\d+', x)]
-        for dnsserver in ('114.114.114.114', '114.114.115.115'):
-            for host in need_resolve_remote:
+        dnsservers = ['114.114.114.114', '114.114.115.115']
+        result_queue = Queue.Queue()
+        for host in need_resolve_remote:
+            for dnsserver in dnsservers:
                 logging.debug('resolve remote host=%r from dnsserver=%r', host, dnsserver)
-                try:
-                    iplist = DNSUtil.remote_resolve(dnsserver, host, timeout=3)
-                    if iplist:
-                        resolved_iplist += iplist
-                        logging.debug('resolve remote host=%r to iplist=%s', host, iplist)
-                except (socket.error, OSError) as e:
-                    logging.exception('resolve remote host=%r dnsserver=%r failed: %s', host, dnsserver, e)
+                threading._start_new_thread(do_remote_resolve, (host, dnsserver, result_queue))
+        for _ in xrange(len(need_resolve_remote) * len(dnsservers)):
+            try:
+                name, dnsserver, iplist = result_queue.get(timeout=2)
+                resolved_iplist += iplist or []
+                logging.debug('resolve remote name=%r from dnsserver=%r return iplist=%s', name, dnsserver, iplist)
+            except Queue.Empty:
+                logging.warn('resolve remote timeout, continue')
+                break
         resolved_iplist = list(set(resolved_iplist))
         if len(resolved_iplist) == 0:
             logging.error('resolve %s host return empty! please retry!', google_hosts)
