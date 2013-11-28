@@ -1645,6 +1645,7 @@ class RangeFetch(object):
     threads = 1
     waitsize = 1024*512
     urlfetch = staticmethod(gae_urlfetch)
+    expect_begin = 0
 
     def __init__(self, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0):
         self.wfile = wfile
@@ -1682,59 +1683,64 @@ class RangeFetch(object):
         data_queue = Queue.PriorityQueue()
         range_queue = Queue.PriorityQueue()
         range_queue.put((start, end, self.response))
+        thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, 0))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
-        for _ in range(self.threads):
-            thread.start_new_thread(self.__fetchlet, (range_queue, data_queue))
+        t0 = time.time()
+        cur_threads = 1
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
-        expect_begin = start
-        while expect_begin < length-1:
+        self.expect_begin = start
+        while self.expect_begin < length-1:
+            while cur_threads < self.threads and time.time() - t0 > cur_threads * common.AUTORANGE_MAXSIZE / 1048576:
+                thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, cur_threads * common.AUTORANGE_MAXSIZE))
+                cur_threads += 1
             try:
                 if has_peek:
                     begin, data = data_queue.peek(timeout=peek_timeout)
-                    if expect_begin == begin:
+                    if self.expect_begin == begin:
                         data_queue.get()
-                    elif expect_begin < begin:
+                    elif self.expect_begin < begin:
                         time.sleep(0.1)
                         continue
                     else:
-                        logging.error('RangeFetch Error: begin(%r) < expect_begin(%r), quit.', begin, expect_begin)
+                        logging.error('RangeFetch Error: begin(%r) < expect_begin(%r), quit.', begin, self.expect_begin)
                         break
                 else:
                     begin, data = data_queue.get(timeout=peek_timeout)
-                    if expect_begin == begin:
+                    if self.expect_begin == begin:
                         pass
-                    elif expect_begin < begin:
+                    elif self.expect_begin < begin:
                         data_queue.put((begin, data))
                         time.sleep(0.1)
                         continue
                     else:
-                        logging.error('RangeFetch Error: begin(%r) < expect_begin(%r), quit.', begin, expect_begin)
+                        logging.error('RangeFetch Error: begin(%r) < expect_begin(%r), quit.', begin, self.expect_begin)
                         break
             except Queue.Empty:
                 logging.error('data_queue peek timeout, break')
                 break
             try:
                 self.wfile.write(data)
-                expect_begin += len(data)
+                self.expect_begin += len(data)
             except Exception as e:
                 logging.info('RangeFetch client connection aborted(%s).', e)
                 break
         self._stopped = True
 
-    def __fetchlet(self, range_queue, data_queue):
+    def __fetchlet(self, range_queue, data_queue, range_delay_size):
         headers = dict((k.title(), v) for k, v in self.headers.items())
         headers['Connection'] = 'close'
         while 1:
             try:
                 if self._stopped:
                     return
-                if data_queue.qsize() * self.bufsize > 180*1024*1024:
-                    time.sleep(10)
-                    continue
-                try:
                     start, end, response = range_queue.get(timeout=1)
+                    if self.expect_begin < start and data_queue.qsize() * self.bufsize + range_delay_size > 30*1024*1024:
+                        range_queue.put((start, end, response))
+                        time.sleep(10)
+                        continue
+                try:
                     headers['Range'] = 'bytes=%d-%d' % (start, end)
                     fetchserver = ''
                     if not response:
@@ -1779,6 +1785,7 @@ class RangeFetch(object):
                             if self._stopped:
                                 response.close()
                                 return
+                            t0 = time.time()
                             data = response.read(self.bufsize)
                             if not data:
                                 break
@@ -1787,6 +1794,9 @@ class RangeFetch(object):
                         except Exception as e:
                             logging.warning('RangeFetch "%s %s" %s failed: %s', self.command, self.url, headers['Range'], e)
                             break
+                    t0 = time.time() - t0
+                    logging.info('>>>>>>>>>>>>>>> Reached {:,} at {:,.0f} KB/s'.format(
+                        start - 1, ((common.AUTORANGE_MAXSIZE+start-end) / t0 / 1024)))
                     if start < end + 1:
                         logging.warning('RangeFetch "%s %s" retry %s-%s', self.command, self.url, start, end)
                         response.close()
@@ -2073,7 +2083,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         headers_sent = False
         fetchserver = common.GAE_FETCHSERVER
         if range_in_query and special_range:
-            fetchserver = re.sub(r'//\w+\.appspot\.com', '//%s.appspot.com' % random.choice(common.GAE_APPIDS), fetchserver)
+            fetchserver = re.sub(r'//[\w-]+\.appspot\.com', '//%s.appspot.com' % random.choice(common.GAE_APPIDS), fetchserver)
         for retry in range(common.FETCHMAX_LOCAL):
             try:
                 content_length = 0
@@ -2122,7 +2132,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     http_util.crlf = 0
                     continue
                 if response.app_status == 500 and range_in_query and special_range:
-                    fetchserver = re.sub(r'//\w+\.appspot\.com', '//%s.appspot.com' % random.choice(common.GAE_APPIDS), fetchserver)
+                    fetchserver = re.sub(r'//[\w-]+\.appspot\.com', '//%s.appspot.com' % random.choice(common.GAE_APPIDS), fetchserver)
                     logging.warning('500 with range in query, trying another APPID')
                     # logging.warning('Temporary fetchserver: %s -> %s' % (common.GAE_FETCHSERVER, fetchserver))
                     # retry -= 1
@@ -2138,7 +2148,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if not headers_sent:
                     logging.info('%s "GAE %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
                     if response.status == 206:
-                        fetchservers = [re.sub(r'//\w+\.appspot\.com', '//%s.appspot.com' % appid, common.GAE_FETCHSERVER) for appid in common.GAE_APPIDS]
+                        fetchservers = [re.sub(r'//[\w-]+\.appspot\.com', '//%s.appspot.com' % appid, common.GAE_FETCHSERVER) for appid in common.GAE_APPIDS]
                         rangefetch = RangeFetch(self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
                         return rangefetch.fetch()
                     if response.getheader('Set-Cookie'):
@@ -2575,6 +2585,52 @@ class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server
         return self.sendto(data[:2] + reply_data[2:], address)
 
 
+def get_process_list():
+    import os
+    import glob
+    import ctypes
+    import collections
+    Process = collections.namedtuple('Process', 'pid name exe')
+    process_list = []
+    if os.name == 'nt':
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+        lpidProcess= (ctypes.c_ulong * 1024)()
+        cb = ctypes.sizeof(lpidProcess)
+        cbNeeded = ctypes.c_ulong()
+        ctypes.windll.psapi.EnumProcesses(ctypes.byref(lpidProcess), cb, ctypes.byref(cbNeeded))
+        nReturned = cbNeeded.value/ctypes.sizeof(ctypes.c_ulong())
+        pidProcess = [i for i in lpidProcess][:nReturned]
+        has_queryimage = hasattr(ctypes.windll.kernel32, 'QueryFullProcessImageNameA')
+        for pid in pidProcess:
+            hProcess = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
+            if hProcess:
+                modname = ctypes.create_string_buffer(2048)
+                count = ctypes.c_ulong(ctypes.sizeof(modname))
+                if has_queryimage:
+                    ctypes.windll.kernel32.QueryFullProcessImageNameA(hProcess, 0, ctypes.byref(modname), ctypes.byref(count))
+                else:
+                    ctypes.windll.psapi.GetModuleFileNameExA(hProcess, 0, ctypes.byref(modname), ctypes.byref(count))
+                exe = modname.value
+                name = os.path.basename(exe)
+                process_list.append(Process(pid=pid, name=name, exe=exe))
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+    elif sys.platform.startswith('linux'):
+        for filename in glob.glob('/proc/[0-9]*/cmdline'):
+            pid = int(filename.split('/')[2])
+            exe_link = '/proc/%d/exe' % pid
+            if os.path.exists(exe_link):
+                exe = os.readlink(exe_link)
+                name = os.path.basename(exe)
+                process_list.append(Process(pid=pid, name=name, exe=exe))
+    else:
+        try:
+            import psutil
+            process_list = psutil.get_process_list()
+        except Exception as e:
+            logging.exception('psutil.get_process_list() failed: %r', e)
+    return process_list
+
 def pre_start():
     if sys.platform == 'cygwin':
         logging.info('cygwin is not officially supported, please continue at your own risk :)')
@@ -2600,8 +2656,8 @@ def pre_start():
                      'QQProtect': False, }
         softwares = [k for k, v in blacklist.items() if v]
         if softwares:
-            tasklist = os.popen('tasklist').read().lower()
-            softwares = [x for x in softwares if x.lower()in tasklist]
+            tasklist = '\n'.join(x.name for x in get_process_list()).lower()
+            softwares = [x for x in softwares if x.lower() in tasklist]
             if softwares:
                 title = u'GoAgent 建议'
                 error = u'某些安全软件(如 %s)可能和本软件存在冲突，造成 CPU 占用过高。\n如有此现象建议暂时退出此安全软件来继续运行GoAgent' % ','.join(softwares)
