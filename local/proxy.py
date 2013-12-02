@@ -1686,12 +1686,13 @@ class RangeFetch(object):
         thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, 0))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
+        thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, 0))
         t0 = time.time()
         cur_threads = 1
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         self.expect_begin = start
-        while self.expect_begin < length-1:
+        while self.expect_begin < length - 1:
             while cur_threads < self.threads and time.time() - t0 > cur_threads * common.AUTORANGE_MAXSIZE / 1048576:
                 thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, cur_threads * common.AUTORANGE_MAXSIZE))
                 cur_threads += 1
@@ -1731,22 +1732,23 @@ class RangeFetch(object):
     def __fetchlet(self, range_queue, data_queue, range_delay_size):
         headers = dict((k.title(), v) for k, v in self.headers.items())
         headers['Connection'] = 'close'
+        t0 = time.time()
         while 1:
             try:
                 if self._stopped:
                     return
-                    start, end, response = range_queue.get(timeout=1)
+                try:
                     if self.expect_begin < start and data_queue.qsize() * self.bufsize + range_delay_size > 30*1024*1024:
                         range_queue.put((start, end, response))
                         time.sleep(10)
                         continue
-                try:
                     headers['Range'] = 'bytes=%d-%d' % (start, end)
                     fetchserver = ''
                     if not response:
                         fetchserver = random.choice(self.fetchservers)
                         if self._last_app_status.get(fetchserver, 200) >= 500:
                             time.sleep(5)
+                        t0 = time.time()
                         response = self.urlfetch(self.command, self.url, headers, self.payload, fetchserver, password=self.password)
                 except Queue.Empty:
                     continue
@@ -1795,13 +1797,13 @@ class RangeFetch(object):
                             logging.warning('RangeFetch "%s %s" %s failed: %s', self.command, self.url, headers['Range'], e)
                             break
                     t0 = time.time() - t0
-                    logging.info('>>>>>>>>>>>>>>> Reached {:,} at {:,.0f} KB/s'.format(
-                        start - 1, ((common.AUTORANGE_MAXSIZE+start-end) / t0 / 1024)))
                     if start < end + 1:
                         logging.warning('RangeFetch "%s %s" retry %s-%s', self.command, self.url, start, end)
                         response.close()
                         range_queue.put((start, end, None))
                         continue
+                    logging.info('>>>>>>>>>>>>>>> Successfully reached {:,} at {:,.0f} KB/s'.format(
+                        start - 1, ((common.AUTORANGE_MAXSIZE+start-end) / t0 / 1024)))
                 else:
                     logging.error('RangeFetch %r return %s', self.url, response.status)
                     response.close()
