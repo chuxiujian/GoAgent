@@ -9,7 +9,7 @@
 #      V.E.O             <V.E.O@tom.com>
 #      Max Lv            <max.c.lv@gmail.com>
 #      AlsoTang          <alsotang@gmail.com>
-#      Christopher Meng  <cickumqt@gmail.com>
+#      Christopher Meng  <i@cicku.me>
 #      Yonsm Guo         <YonsmGuo@gmail.com>
 #      Parkman           <cseparkman@gmail.com>
 #      Ming Bai          <mbbill@gmail.com>
@@ -55,6 +55,7 @@ except ImportError:
 except TypeError:
     gevent.monkey.patch_all()
     sys.stderr.write('\033[31m  Warning: Please update gevent to the latest 1.0 version!\033[0m\n')
+
 import errno
 import binascii
 import time
@@ -62,6 +63,7 @@ import struct
 import collections
 import zlib
 import functools
+import itertools
 import re
 import io
 import fnmatch
@@ -1158,10 +1160,10 @@ class HTTPUtil(object):
                 pass
             proxyhost, _, proxyport = proxyaddress.rpartition(':')
             sock = socket.create_connection((proxyhost, int(proxyport)))
-            if host.endswith('.appspot.com'):
-                hostname = 'www.google.com'
-            elif host in self.dns:
+            if host in self.dns:
                 hostname = random.choice(self.dns[host])
+            elif host.endswith('.appspot.com'):
+                hostname = 'www.google.com'
             else:
                 hostname = host
             request_data = 'CONNECT %s:%s HTTP/1.1\r\n' % (hostname, port)
@@ -1494,7 +1496,7 @@ class Common(object):
                         resolved_iplist += iplist
                 except (socket.error, OSError):
                     need_resolve_remote += [host]
-            if name == 'google_hk' and len(resolved_iplist) < 32:
+            if name != 'google_cn' and name.startswith('google_') and len(resolved_iplist) < 32:
                 logging.warning('local need_resolve_hosts=%s is too short, try remote_resolve', need_resolve_hosts)
                 need_resolve_remote += [x for x in need_resolve_hosts if ':' not in x and not re.match(r'\d+\.\d+\.\d+\.\d+', x)]
             dnsservers = ['114.114.114.114', '114.114.115.115']
@@ -1511,7 +1513,11 @@ class Common(object):
                 except Queue.Empty:
                     logging.warn('resolve remote timeout, continue')
                     break
-            resolved_iplist = list(set(resolved_iplist))
+            if name in ('google_cn', 'google_hk'):
+                resolved_iplist = list(set(resolved_iplist))
+            else:
+                iplist_prefix = re.split(r'[\.:]', resolved_iplist[0])[0]
+                resolved_iplist = list(set(x for x in resolved_iplist if x.startswith(iplist_prefix)))
             if len(resolved_iplist) == 0:
                 logging.error('resolve %s host return empty! please retry!', name)
                 sys.exit(-1)
@@ -1702,10 +1708,10 @@ class RangeFetch(object):
     bufsize = 8192
     threads = 1
     waitsize = 1024*512
-    urlfetch = staticmethod(gae_urlfetch)
     expect_begin = 0
 
-    def __init__(self, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0):
+    def __init__(self, urlfetch, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0):
+        self.urlfetch = urlfetch
         self.wfile = wfile
         self.response = response
         self.command = method
@@ -1748,7 +1754,7 @@ class RangeFetch(object):
         t0 = time.time()
         cur_threads = 1
         has_peek = hasattr(data_queue, 'peek')
-        peek_timeout = 90
+        peek_timeout = 120
         self.expect_begin = start
         while self.expect_begin < length - 1:
             while cur_threads < self.threads and time.time() - t0 > cur_threads * common.AUTORANGE_MAXSIZE / 1048576:
@@ -1895,7 +1901,7 @@ class LocalProxyServer(SocketServer.ThreadingTCPServer):
             SocketServer.ThreadingTCPServer.handle_error(self, *args)
 
 
-def expand_google_iplist(domains, max_count=100):
+def expand_google_hk_iplist(domains, max_count=100):
     iplist = sum([socket.gethostbyname_ex(x)[-1] for x in domains if not re.match(r'\d+\.\d+\.\d+\.\d+', x)], [])
     cranges = set(x.rpartition('.')[0] for x in iplist)
     need_expand = list(set(['%s.%d' % (c, i) for c in cranges for i in xrange(1, 254)]) - set(iplist))
@@ -1912,17 +1918,17 @@ def expand_google_iplist(domains, max_count=100):
             urllib2.build_opener(urllib2.ProxyHandler({})).open(request)
             ip_connection_time[(ip, 443)] = time.time() - start_time
         except socket.error as e:
-            logging.debug('expand_google_iplist(%s) error: %r', ip, e)
+            logging.debug('expand_google_hk_iplist(%s) error: %r', ip, e)
         except urllib2.HTTPError as e:
-            if e.code == 404:
-                logging.debug('expand_google_iplist(%s) OK', ip)
+            if e.code == 404 and 'google' in e.headers.get('Server', '').lower():
+                logging.debug('expand_google_hk_iplist(%s) OK', ip)
                 ip_connection_time[(ip, 443)] = time.time() - start_time
             else:
-                logging.debug('expand_google_iplist(%s) error: %r', ip, e.code)
+                logging.debug('expand_google_hk_iplist(%s) error: %r', ip, e.code)
         except urllib2.URLError as e:
-            logging.debug('expand_google_iplist(%s) error: %r', ip, e)
+            logging.debug('expand_google_hk_iplist(%s) error: %r', ip, e)
         except Exception as e:
-            logging.warn('expand_google_iplist(%s) error: %r', ip, e)
+            logging.warn('expand_google_hk_iplist(%s) error: %r', ip, e)
         finally:
             if sock:
                 sock.close()
@@ -1932,7 +1938,7 @@ def expand_google_iplist(domains, max_count=100):
     http_util.tcp_connection_time.update(ip_connection_time)
     http_util.ssl_connection_time.update(ip_connection_time)
     common.IPLIST_MAP['google_hk'] += [x[0] for x in ip_connection_time]
-    logging.info('expand_google_iplist end. iplist=%s', ip_connection_time)
+    logging.info('expand_google_hk_iplist end. iplist=%s', ip_connection_time)
 
 
 class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -1947,15 +1953,15 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         """GAEProxyHandler setup, init domain/iplist map"""
         if not common.PROXY_ENABLE:
             if 'google_hk' in common.IPLIST_MAP:
-                threading._start_new_thread(expand_google_iplist, (common.IPLIST_MAP['google_hk'][:], 16))
+                threading._start_new_thread(expand_google_hk_iplist, (common.IPLIST_MAP['google_hk'][:], 16))
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
-            for appid in common.GAE_APPIDS:
-                host = '%s.appspot.com' % appid
-                if host not in common.HOSTS_MAP:
-                    common.HOSTS_MAP[host] = common.HOSTS_POSTFIX_MAP['.appspot.com']
-                if host not in http_util.dns:
-                    http_util.dns[host] = common.IPLIST_MAP[common.HOSTS_MAP[host]]
+        for appid in common.GAE_APPIDS:
+            host = '%s.appspot.com' % appid
+            if host not in common.HOSTS_MAP:
+                common.HOSTS_MAP[host] = common.HOSTS_POSTFIX_MAP['.appspot.com']
+            if host not in http_util.dns:
+                http_util.dns[host] = common.IPLIST_MAP[common.HOSTS_MAP[host]]
 
     def setup(self):
         if isinstance(self.__class__.first_run, collections.Callable):
@@ -2147,7 +2153,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     logging.info('%s "GAE %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
                     if response.status == 206:
                         fetchservers = [re.sub(r'//[\w-]+\.appspot\.com', '//%s.appspot.com' % appid, common.GAE_FETCHSERVER) for appid in common.GAE_APPIDS]
-                        rangefetch = RangeFetch(self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
+                        rangefetch = RangeFetch(gae_urlfetch, self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
                         return rangefetch.fetch()
                     if response.getheader('Set-Cookie'):
                         response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
@@ -2327,6 +2333,18 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self.__realconnection = None
 
 
+class XORFileObject(object):
+    """fileobj for xor"""
+    def __init__(self, stream, key):
+        self.__stream = stream
+        self.__key_gen = itertools.cycle(key).next
+    def __getattr__(self, attr):
+        if attr not in ('__stream', '__cipher'):
+            return getattr(self.__stream, attr)
+    def read(self, size=-1):
+        return ''.join(chr(ord(x) ^ ord(self.__key_gen())) for x in self.__stream.read(size))
+
+
 def paas_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     if payload:
         if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
@@ -2347,23 +2365,25 @@ def paas_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
+    response.app_transfer_encoding = response.getheader('Transfer-Encoding', '')
     if response.status != 200:
         if response.status in (400, 405):
             # filter by some firewall
             common.PAAS_CRLF = 0
         return response
-    data = response.read(4)
-    if len(data) < 4:
-        response.status = 502
-        response.fp = io.BytesIO(b'connection aborted. too short leadtype data=' + data)
-        return response
-    response.status, headers_length = struct.unpack('!hh', data)
-    data = response.read(headers_length)
-    if len(data) < headers_length:
-        response.status = 502
-        response.fp = io.BytesIO(b'connection aborted. too short headers data=' + data)
-        return response
-    response.msg = httplib.HTTPMessage(io.BytesIO(zlib.decompress(data, -zlib.MAX_WBITS)))
+    data = ''
+    while not data.endswith('\r\n\r\n'):
+        data += response.read(1)
+    response.read(2)
+    message = httplib.HTTPMessage(io.BytesIO(data))
+    if message.getheader('Status'):
+        response.status = message.getheader('Status')
+        del message['Status']
+    if response.app_transfer_encoding == 'chunked':
+        message['Transfer-Encoding'] = 'chunked'
+    response.msg = message
+    if kwargs.get('password') and response.fp:
+        response.fp = XORFileObject(response.fp, kwargs['password'])
     return response
 
 
@@ -2451,7 +2471,10 @@ class PAASProxyHandler(GAEProxyHandler):
             logging.info('%s "PAAS %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
             if response.app_status in (400, 405):
                 http_util.crlf = 0
-
+            if response.status == 206:
+                fetchservers = [common.PAAS_FETCHSERVER]
+                rangefetch = RangeFetch(paas_urlfetch, self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
+                return rangefetch.fetch()
             if response.getheader('Set-Cookie'):
                 response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
             self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
