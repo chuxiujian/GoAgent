@@ -47,6 +47,7 @@ try:
     import gevent
     import gevent.socket
     import gevent.server
+    import gevent.wsgi
     import gevent.queue
     import gevent.event
     import gevent.monkey
@@ -1045,10 +1046,9 @@ class HTTPUtil(object):
                 # verify SSL certificate.
                 if self.ssl_validate and address[0].endswith('.appspot.com'):
                     cert = ssl_sock.getpeercert()
-                    commonname = next((v for ((k, v),) in cert['subject'] if k == 'commonName'))
-                    fields = commonname.split('.')
-                    if not (('google' in fields and all(len(x) <=3 for x in fields[fields.index('google')+1:])) or commonname.endswith('appspot.com')):
-                        raise ssl.SSLError("Host name '%s' doesn't match certificate host '%s'" % (address[0], commonname))
+                    orgname = next((v for ((k, v),) in cert['subject'] if k == 'organizationName'))
+                    if not orgname.lower().startswith('google '):
+                        raise ssl.SSLError("%r certificate organizationName(%r) not startswith 'Google'" % (address[0], orgname))
                 # put ssl socket object to output queobj
                 queobj.put(ssl_sock)
             except (socket.error, ssl.SSLError, OSError) as e:
@@ -1406,9 +1406,10 @@ class Common(object):
 
         self.METHOD_REMATCH_MAP = collections.OrderedDict((re.compile(k).match, v) for k, v in self.CONFIG.items(hosts_section) if '\\' in k)
 
+        self.HTTP_WITHGAE = set(self.CONFIG.get(http_section, 'withgae').split('|'))
+        self.HTTP_CRLFSITES = tuple(self.CONFIG.get(http_section, 'crlfsites').split('|'))
         self.HTTP_FORCEHTTPS = set(self.CONFIG.get(http_section, 'forcehttps').split('|'))
         self.HTTP_FAKEHTTPS = set(self.CONFIG.get(http_section, 'fakehttps').split('|'))
-        self.HTTP_WITHGAE = set(self.CONFIG.get(http_section, 'withgae').split('|'))
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|')) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOSTS_MAP.items() if k == v)
@@ -1985,7 +1986,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     first_run_lock = threading.Lock()
     urlfetch = staticmethod(gae_urlfetch)
     normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
-    normattachment = functools.partial(re.compile(r'filename=(.+?)').sub, 'filename="\\1"')
+    normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
@@ -2043,7 +2044,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.headers['User-Agent'] = common.USERAGENT_STRING
         if host in common.HTTP_WITHGAE:
             return self.do_METHOD_AGENT()
-        if host in common.HTTP_FORCEHTTPS:
+        if host in common.HTTP_FORCEHTTPS and not self.headers.get('Referer', '').startswith('https://'):
             return self.wfile.write(('HTTP/1.1 301\r\nLocation: %s\r\n\r\n' % self.path.replace('http://', 'https://', 1)).encode())
         if self.command not in ('GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH'):
             return self.do_METHOD_FWD()
@@ -2067,13 +2068,14 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 common.HOSTS_MAP[host] = hostname
             else:
                 hostname = host
+            need_crlf = hostname.startswith('google_') or host.endswith(common.HTTP_CRLFSITES)
             hostname = hostname or host
             if hostname in common.IPLIST_MAP:
                 http_util.dns[host] = common.IPLIST_MAP[hostname]
             else:
                 http_util.dns[host] = sum((http_util.dns_resolve(x) for x in hostname.split('|')), [])
             connection_cache_key = hostname if host not in common.HTTP_FAKEHTTPS else None
-            response = http_util.request(self.command, self.path, payload, self.headers, crlf=common.GAE_CRLF, connection_cache_key=connection_cache_key)
+            response = http_util.request(self.command, self.path, payload, self.headers, crlf=need_crlf, connection_cache_key=connection_cache_key)
             if not response:
                 return
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
@@ -2392,25 +2394,11 @@ def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
-    response.app_transfer_encoding = response.getheader('Transfer-Encoding', '')
     if response.status != 200:
         if response.status in (400, 405):
             # filter by some firewall
             common.PHP_CRLF = 0
         return response
-    data = ''
-    while not data.endswith('\r\n\r\n'):
-        data += response.read(1)
-    response.read(2)
-    message = httplib.HTTPMessage(io.BytesIO(data))
-    if message.getheader('Status'):
-        response.status = message.getheader('Status')
-        del message['Status']
-    if response.app_transfer_encoding == 'chunked':
-        message['Transfer-Encoding'] = 'chunked'
-    response.msg = message
-    if kwargs.get('password') and response.fp:
-        response.fp = XORFileObject(response.fp, kwargs['password'][0])
     return response
 
 
@@ -2494,20 +2482,16 @@ class PHPProxyHandler(GAEProxyHandler):
                 return
 
             logging.info('%s "PHP %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-            if response.app_status in (400, 405):
-                http_util.crlf = 0
-            if response.status == 206:
-                fetchservers = [common.PHP_FETCHSERVER]
-                rangefetch = RangeFetch(php_urlfetch, self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
-                return rangefetch.fetch()
-            if response.getheader('Set-Cookie'):
-                response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+            if response.status != 200:
+                self.wfile.write('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
 
+            cipher = response.status == 200 and common.PHP_PASSWORD and XORCipher(common.PHP_PASSWORD[0])
             while 1:
                 data = response.read(8192)
                 if not data:
                     break
+                if cipher:
+                    data = cipher.encrypt(data)
                 self.wfile.write(data)
             response.close()
 
@@ -2516,100 +2500,38 @@ class PHPProxyHandler(GAEProxyHandler):
             if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
                 raise
 
-class PAASProxyHandler(GAEProxyHandler):
-
-    first_run_lock = threading.Lock()
-
-    def first_run(self):
-        if not common.PROXY_ENABLE:
-            common.resolve_iplist()
-            fetchhost = re.sub(r':\d+$', '', urlparse.urlparse(common.PAAS_FETCHSERVER).netloc)
-            logging.info('resolve common.PAAS_FETCHSERVER domain=%r to iplist', fetchhost)
-            fethhost_iplist = http_util.dns_resolve(fetchhost)
-            if len(fethhost_iplist) == 0:
-                logging.error('resolve %r domain return empty! please use ip list to replace domain list!', fetchhost)
-                sys.exit(-1)
-            http_util.dns[fetchhost] = list(set(fethhost_iplist))
-            logging.info('resolve common.PAAS_FETCHSERVER domain to iplist=%r', fethhost_iplist)
-        return True
-
-    def setup(self):
-        if isinstance(self.__class__.first_run, collections.Callable):
-            try:
-                with self.__class__.first_run_lock:
-                    if isinstance(self.__class__.first_run, collections.Callable):
-                        self.first_run()
-                        self.__class__.first_run = None
-            except NetWorkIOError as e:
-                logging.error('PAASProxyHandler.first_run() return %r', e)
-            except Exception as e:
-                logging.exception('PAASProxyHandler.first_run() return %r', e)
-        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
-        if common.PAAS_USEHOSTS:
-            self.__class__.do_GET = self.__class__.do_METHOD
-            self.__class__.do_PUT = self.__class__.do_METHOD
-            self.__class__.do_POST = self.__class__.do_METHOD
-            self.__class__.do_HEAD = self.__class__.do_METHOD
-            self.__class__.do_DELETE = self.__class__.do_METHOD
-            self.__class__.do_OPTIONS = self.__class__.do_METHOD
-            self.__class__.do_CONNECT = GAEProxyHandler.do_CONNECT
+def paas_application(environ, start_response):
+    method = environ['REQUEST_METHOD']
+    path_info = environ['PATH_INFO']
+    wsgi_input = environ['wsgi.input']
+    if method == 'CONNECT':
+        host, _, port = path_info.rpartition(':')
+        ps_result = urlparse.urlparse(common.PAAS_FETCHSERVER)
+        paas_host = ps_result.netloc
+        paas_port = 443 if ps_result.scheme == 'https' else 80
+        logging.info('create_connection(%r, %r)', paas_host, paas_port)
+        sock = socket.create_connection((paas_host, paas_port), timeout=5)
+        if ps_result.scheme == 'https':
+            sock = ssl.wrap_socket(sock)
+        request = 'POST %s?host=%s&port=%s&ssl=0 HTTP/1.1\r\nHost: %s\r\n\r\n' % (ps_result.path, host, port, paas_host)
+        sock.send(request)
+        logging.info('PAAS POST sock=%r with request=%r', sock, request)
+        rfile = sock.makefile('rb', 0)
+        lines = []
+        while True:
+            line = rfile.readline()
+            if line == '\r\n':
+                break
+            lines.append(line)
+        print lines
+        status = int(lines[0].split()[1])
+        start_response(' '.join(lines[0].split()[1:]), [])
+        if status == 200:
+            http_util.forward_socket(wsgi_input.socket, sock)
         else:
-            self.__class__.do_GET = self.__class__.do_METHOD_AGENT
-            self.__class__.do_PUT = self.__class__.do_METHOD_AGENT
-            self.__class__.do_POST = self.__class__.do_METHOD_AGENT
-            self.__class__.do_HEAD = self.__class__.do_METHOD_AGENT
-            self.__class__.do_DELETE = self.__class__.do_METHOD_AGENT
-            self.__class__.do_OPTIONS = self.__class__.do_METHOD_AGENT
-            self.__class__.do_CONNECT = GAEProxyHandler.do_CONNECT_AGENT
-        self.setup()
-
-    def do_METHOD_AGENT(self):
-        try:
-            headers = dict((k.title(), v) for k, v in self.headers.items())
-            ps_result = urlparse.urlparse(self.path)
-            host = headers.get('Host') or ps_result.netloc
-            if re.search(r':\d+$', host):
-                host, _, port = host.partition(':')
-                port = int(port)
-            else:
-                port = {'https': 443, 'http': 80, 'ftp': 21}.get(ps_result.scheme, 80)
-            headers['Connection'] = 'close'
-            payload = '%s %s HTTP/1.1\r\n' % (self.command, '%s?%s' % (ps_result.path, ps_result.query) if ps_result.query else ps_result.path)
-            payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items())
-            payload += '\r\n'
-            if 'Content-Length' in headers:
-                try:
-                    payload += self.rfile.read(int(headers.get('Content-Length', 0)))
-                except NetWorkIOError as e:
-                    logging.error('handle_method read payload failed:%s', e)
-                    return
-            kwargs = {'host': host, 'port': port}
-            if common.PAAS_PASSWORD:
-                kwargs['password'] = common.PAAS_PASSWORD
-            if common.PAAS_VALIDATE:
-                kwargs['validate'] = 1
-            if ps_result.scheme == 'https':
-                kwargs['ssl'] = 1
-            url = '%s?%s' % (common.PAAS_FETCHSERVER.rstrip('?'), base64.b64encode(urllib.urlencode(kwargs)).strip())
-            response = http_util.request('POST', url, payload)
-            errors = []
-            if response is None:
-                html = message_html('502 PAAS URLFetch failed', 'Local PAAS URLFetch %r failed' % self.path, str(errors))
-                self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
-                return
-            logging.info('%s "PAAS %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-            if response.status in (400, 405):
-                http_util.crlf = 0
-            while 1:
-                data = response.read(8192)
-                if not data:
-                    break
-                self.wfile.write(data)
-            response.close()
-        except NetWorkIOError as e:
-            # Connection closed before proxy return
-            if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
-                raise
+            print rfile.read(100)
+    else:
+        raise NotImplementedError
 
 
 class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -2860,8 +2782,11 @@ def main():
     sys.stdout.write(common.info())
 
     if common.PAAS_ENABLE:
+        if not gevent:
+            logging.error('PAAS proxy requires gevent 1.0+')
+            sys.exit(-1)
         host, port = common.PAAS_LISTEN.split(':')
-        server = LocalProxyServer((host, int(port)), PAASProxyHandler)
+        server = gevent.wsgi.WSGIServer((host, int(port)), paas_application)
         thread.start_new_thread(server.serve_forever, tuple())
 
     if common.PHP_ENABLE:

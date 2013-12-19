@@ -6,10 +6,11 @@
 // Contributor:
 //     Phus Lu        <phus.lu@gmail.com>
 
-$__version__  = '3.1.0';
+$__version__  = '3.1.1';
 $__password__ = '';
 $__timeout__  = 20;
 $__content_type__ = 'image/gif';
+$__content__ = '';
 
 
 function message_html($title, $banner, $detail) {
@@ -81,32 +82,36 @@ function decode_request($data) {
     return array($method, $url, $headers, $kwargs, $body);
 }
 
-function header_function($ch, $header) {
-    if (substr($header, 0, 5) == 'HTTP/') {
-        $terms = explode(' ', $header);
-        $status = intval($terms[1]);
-        $GLOBALS['__status__'] == $status;
-        echo "Status: $status\r\n";
-    } elseif (substr($header, 0, 17) == 'Transfer-Encoding') {
-        // skip transfer-encoding
+
+function echo_content($content) {
+    global $__password__;
+    if ($__password__) {
+        echo $content ^ str_repeat($__password__[0], strlen($content));
     } else {
-        echo $header;
+        echo $content;
+    }
+}
+
+
+function header_function($ch, $header) {
+    global $__content__;
+    if (!$__content__) {
+        header('Content-Type: ' . $__content_type__);
+    }
+    if (strncasecmp($header, 'Transfer-Encoding', 17) != 0) {
+        $__content__ .= $header;
     }
     return strlen($header);
 }
 
-function write_function($ch, $content) {
-    if (!isset($GLOBALS['__body_sent__'])) {
-        $GLOBALS['__body_sent__'] = true;
-        echo "\r\n";
-    }
 
-    $password = $GLOBALS['__password__'];
-    if ($password) {
-        echo $content ^ str_repeat($password[0], strlen($content));
-    } else {
-        echo $content;
+function write_function($ch, $content) {
+    global $__content__;
+    if ($__content__) {
+        echo_content($__content__);
+        $__content__ = '';
     }
+    echo_content($content);
     return strlen($content);
 }
 
@@ -164,7 +169,7 @@ function post()
             $curl_opt[CURLOPT_POSTFIELDS] = $body;
             break;
         default:
-            print(message_html('502 Urlfetch Error', 'Invalid Method: ' . $method,  $url));
+            echo_content("HTTP/1.0 502\r\n\r\n" . message_html('502 Urlfetch Error', 'Invalid Method: ' . $method,  $url));
             exit(-1);
     }
 
@@ -180,12 +185,15 @@ function post()
     curl_setopt_array($ch, $curl_opt);
     $ret = curl_exec($ch);
     $errno = curl_errno($ch);
-    if ($errno && !isset($GLOBALS['__status__'])) {
-        header('HTTP/1.0 502');
-        echo message_html('502 Urlfetch Error', "PHP Urlfetch Error curl($errno)",  curl_error($ch));
+    if ($GLOBALS['__content__']) {
+        echo_content($GLOBALS['__content__']);
+    } else if ($errno) {
+        $content = "HTTP/1.0 502\r\n\r\n" . message_html('502 Urlfetch Error', "PHP Urlfetch Error curl($errno)",  curl_error($ch));
+        echo_content($content);
     }
     curl_close($ch);
 }
+
 
 function get() {
     $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : $_SERVER['SERVER_NAME'];
@@ -196,6 +204,7 @@ function get() {
         header('Location: https://www.google.com');
     }
 }
+
 
 function main() {
     if ($_SERVER['REQUEST_METHOD'] == 'POST') {
