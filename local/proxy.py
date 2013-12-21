@@ -1789,16 +1789,13 @@ class RangeFetch(object):
         thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, 0))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
-        thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, 0))
-        t0 = time.time()
-        cur_threads = 1
+        for i in xrange(0, self.threads):
+            range_delay_size = i * common.AUTORANGE_MAXSIZE
+            spawn_later(range_delay_size/524288.0, self.__fetchlet, range_queue, data_queue, range_delay_size)
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 120
         self.expect_begin = start
         while self.expect_begin < length - 1:
-            while cur_threads < self.threads and time.time() - t0 > cur_threads * common.AUTORANGE_MAXSIZE / 1048576:
-                thread.start_new_thread(self.__fetchlet, (range_queue, data_queue, cur_threads * common.AUTORANGE_MAXSIZE))
-                cur_threads += 1
             try:
                 if has_peek:
                     begin, data = data_queue.peek(timeout=peek_timeout)
@@ -2039,7 +2036,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.path = 'http://%s%s' % (host, self.path)
         elif not host and '://' in self.path:
             host = urlparse.urlparse(self.path).netloc
-        self.parsed_url = urlparse.urlparse(self.path)
+        self.url_parts = urlparse.urlparse(self.path)
         if common.USERAGENT_ENABLE:
             self.headers['User-Agent'] = common.USERAGENT_STRING
         if host in common.HTTP_WITHGAE:
@@ -2058,7 +2055,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             payload = self.rfile.read(content_length) if content_length else b''
-            host = self.parsed_url.netloc
+            host = self.url_parts.netloc
             if any(x(self.path) for x in common.METHOD_REMATCH_MAP):
                 hostname = next(common.METHOD_REMATCH_MAP[x] for x in common.METHOD_REMATCH_MAP if x(self.path))
             elif host in common.HOSTS_MAP:
@@ -2091,7 +2088,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except NetWorkIOError as e:
             if e.args[0] in (errno.ECONNRESET, 10063, errno.ENAMETOOLONG):
                 logging.warn('http_util.request "%s %s" failed:%s, try addto `withgae`', self.command, self.path, e)
-                common.HTTP_WITHGAE = tuple(list(common.HTTP_WITHGAE)+[re.sub(r':\d+$', '', self.parsed_url.netloc)])
+                common.HTTP_WITHGAE = tuple(list(common.HTTP_WITHGAE)+[re.sub(r':\d+$', '', self.url_parts.netloc)])
             elif e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
                 raise
         except Exception as e:
@@ -2103,8 +2100,8 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         """GAE http urlfetch"""
         request_headers = dict((k.title(), v) for k, v in self.headers.items())
         host = request_headers.get('Host', '')
-        path = self.parsed_url.path
-        range_in_query = 'range=' in self.parsed_url.query
+        path = self.url_parts.path
+        range_in_query = 'range=' in self.url_parts.query
         special_range = (any(x(host) for x in common.AUTORANGE_HOSTS_MATCH) or path.endswith(common.AUTORANGE_ENDSWITH)) and not path.endswith(common.AUTORANGE_NOENDSWITH)
         if self.command != 'HEAD' and 'Range' in request_headers:
             m = re.search(r'bytes=(\d+)-', request_headers['Range'])
