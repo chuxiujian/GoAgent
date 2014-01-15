@@ -5,7 +5,6 @@ $__version__  = '3.1.2';
 $__password__ = '123456';
 $__hostsdeny__ = array(); // $__hostsdeny__ = array('.youtube.com', '.youku.com');
 $__content_type__ = 'image/gif';
-$__use_curl__ = function_exists('curl_version');
 $__timeout__ = 20;
 $__content__ = '';
 
@@ -151,7 +150,9 @@ function post() {
     if ($body) {
         $headers['Content-Length'] = strval(strlen($body));
     }
-    $headers['Connection'] = 'close';
+    if (isset($headers['Connection'])) {
+        $headers['Connection'] = 'close';
+    }
 
     $header_array = array();
     foreach ($headers as $key => $value) {
