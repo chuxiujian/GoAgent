@@ -3,10 +3,10 @@
 
 $__version__  = '3.1.2';
 $__password__ = '123456';
-$__hostsdeny__ = array();  # $__hostsdeny__ = array('.youtube.com', '.youku.com')
+$__hostsdeny__ = array(); // $__hostsdeny__ = array('.youtube.com', '.youku.com');
 $__content_type__ = 'image/gif';
-$__content__ = '';
 $__timeout__ = 20;
+$__content__ = '';
 
 
 function message_html($title, $banner, $detail) {
@@ -80,8 +80,8 @@ function decode_request($data) {
 
 
 function echo_content($content) {
-    global $__password__;
-    if ($__password__) {
+    global $__password__, $__content_type__;
+    if ($__content_type__ == 'image/gif') {
         echo $content ^ str_repeat($__password__[0], strlen($content));
     } else {
         echo $content;
@@ -89,21 +89,32 @@ function echo_content($content) {
 }
 
 
-function header_function($ch, $header) {
-    global $__content__;
-    if (!$__content__) {
-        header('Content-Type: ' . $__content_type__);
-    }
-    if (strncasecmp($header, 'Transfer-Encoding:', 18) != 0) {
+function curl_header_function($ch, $header) {
+    global $__content__, $__content_type__;
+    $pos = strpos($header, ':');
+    if ($pos == false) {
         $__content__ .= $header;
+    } else {
+        $key = join('-', array_map('ucfirst', explode('-', substr($header, 0, $pos))));
+        if ($key != 'Transfer-Encoding') {
+            $__content__ .= $key . substr($header, $pos);
+        }
+    }
+    if (preg_match('@^Content-Type: ?(audio/|image/|video/|application/octet-stream)@i', $headers)) {
+        $__content_type__ = 'image/x-png';
+    }
+    if (!trim($header)) {
+        header('Content-Type: ' . $__content_type__);
     }
     return strlen($header);
 }
 
 
-function write_function($ch, $content) {
+function curl_write_function($ch, $content) {
     global $__content__;
     if ($__content__) {
+        // for debug
+        // echo_content("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n");
         echo_content($__content__);
         $__content__ = '';
     }
@@ -111,8 +122,8 @@ function write_function($ch, $content) {
     return strlen($content);
 }
 
-function post()
-{
+
+function post() {
     list($method, $url, $headers, $kwargs, $body) = @decode_request(@file_get_contents('php://input'));
 
     $password = $GLOBALS['__password__'];
@@ -124,30 +135,33 @@ function post()
         }
     }
 
+    $hostsdeny = $GLOBALS['__hostsdeny__'];
+    if ($hostsdeny) {
+        $urlparts = parse_url($url);
+        $host = $urlparts['host'];
+        foreach ($hostsdeny as $pattern) {
+            if (substr($host, strlen($host)-strlen($pattern)) == $pattern) {
+                echo_content("HTTP/1.0 403\r\n\r\n" . message_html('403 Forbidden', "hostsdeny matched($host)",  $url));
+                exit(-1);
+            }
+        }
+    }
+
     if ($body) {
         $headers['Content-Length'] = strval(strlen($body));
     }
-    $headers['Connection'] = 'close';
+    if (isset($headers['Connection'])) {
+        $headers['Connection'] = 'close';
+    }
+
+    $header_array = array();
+    foreach ($headers as $key => $value) {
+        $header_array[] = join('-', array_map('ucfirst', explode('-', $key))).': '.$value;
+    }
 
     $timeout = $GLOBALS['__timeout__'];
 
     $curl_opt = array();
-
-    $curl_opt[CURLOPT_RETURNTRANSFER] = true;
-    $curl_opt[CURLOPT_BINARYTRANSFER] = true;
-
-    $curl_opt[CURLOPT_HEADER]         = false;
-    $curl_opt[CURLOPT_HEADERFUNCTION] = 'header_function';
-    $curl_opt[CURLOPT_WRITEFUNCTION]  = 'write_function';
-
-    $curl_opt[CURLOPT_FAILONERROR]    = true;
-    $curl_opt[CURLOPT_FOLLOWLOCATION] = false;
-
-    $curl_opt[CURLOPT_CONNECTTIMEOUT] = $timeout;
-    $curl_opt[CURLOPT_TIMEOUT]        = $timeout;
-
-    $curl_opt[CURLOPT_SSL_VERIFYPEER] = false;
-    $curl_opt[CURLOPT_SSL_VERIFYHOST] = false;
 
     switch (strtoupper($method)) {
         case 'HEAD':
@@ -169,13 +183,22 @@ function post()
             exit(-1);
     }
 
-    $header_array = array();
-    foreach ($headers as $key => $value) {
-        if ($key) {
-            $header_array[] = join('-', array_map('ucfirst', explode('-', $key))).': '.$value;
-        }
-    }
     $curl_opt[CURLOPT_HTTPHEADER] = $header_array;
+    $curl_opt[CURLOPT_RETURNTRANSFER] = true;
+    $curl_opt[CURLOPT_BINARYTRANSFER] = true;
+
+    $curl_opt[CURLOPT_HEADER]         = false;
+    $curl_opt[CURLOPT_HEADERFUNCTION] = 'curl_header_function';
+    $curl_opt[CURLOPT_WRITEFUNCTION]  = 'curl_write_function';
+
+    $curl_opt[CURLOPT_FAILONERROR]    = false;
+    $curl_opt[CURLOPT_FOLLOWLOCATION] = false;
+
+    $curl_opt[CURLOPT_CONNECTTIMEOUT] = $timeout;
+    $curl_opt[CURLOPT_TIMEOUT]        = $timeout;
+
+    $curl_opt[CURLOPT_SSL_VERIFYPEER] = false;
+    $curl_opt[CURLOPT_SSL_VERIFYHOST] = false;
 
     $ch = curl_init($url);
     curl_setopt_array($ch, $curl_opt);
@@ -184,12 +207,14 @@ function post()
     if ($GLOBALS['__content__']) {
         echo_content($GLOBALS['__content__']);
     } else if ($errno) {
+        if (!headers_sent()) {
+            header('Content-Type: ' . $__content_type__);
+        }
         $content = "HTTP/1.0 502\r\n\r\n" . message_html('502 Urlfetch Error', "PHP Urlfetch Error curl($errno)",  curl_error($ch));
         echo_content($content);
     }
     curl_close($ch);
 }
-
 
 function get() {
     $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : $_SERVER['SERVER_NAME'];

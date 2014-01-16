@@ -1,30 +1,35 @@
 #!/usr/bin/env python
 # coding:utf-8
 
-__version__ = '3.1.2'
+__version__ = '3.1.4'
 __password__ = '123456'
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 __content_type__ = 'image/gif'
 __timeout__ = 20
 
+try:
+    import gevent
+    import gevent.queue
+    import gevent.monkey
+    gevent.monkey.patch_all()
+except ImportError:
+    pass
 
 import sys
 import re
 import time
 import itertools
 import functools
-import collections
 import logging
 import string
 import urlparse
 import httplib
 import struct
 import zlib
+import collections
 import Queue
 
-
-HTTP_CONNECTION_CACHE = collections.defaultdict(Queue.PriorityQueue)
-
+normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
 
 def message_html(title, banner, detail=''):
     MESSAGE_TEMPLATE = '''
@@ -60,44 +65,49 @@ def message_html(title, banner, detail=''):
 class XORCipher(object):
     """XOR Cipher Class"""
     def __init__(self, key):
-        assert isinstance(key, basestring) and key
         self.__key_gen = itertools.cycle([ord(x) for x in key]).next
+        self.__key_xor = lambda s: ''.join(chr(ord(x) ^ self.__key_gen()) for x in s)
+        if len(key) == 1:
+            try:
+                from Crypto.Util.strxor import strxor_c
+                c = ord(key)
+                self.__key_xor = lambda s: strxor_c(s, c)
+            except ImportError:
+                sys.stderr.write('Load Crypto.Util.strxor Failed, Use Pure Python Instead.\n')
 
     def encrypt(self, data):
-        return ''.join(chr(ord(x) ^ self.__key_gen()) for x in data)
+        return self.__key_xor(data)
 
+
+def decode_request(data):
+    metadata_length, = struct.unpack('!h', data[:2])
+    metadata = zlib.decompress(data[2:2+metadata_length], -zlib.MAX_WBITS)
+    body = data[2+metadata_length:]
+    headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
+    method = headers.pop('G-Method')
+    url = headers.pop('G-Url')
+    kwargs = {}
+    any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
+    if headers.get('Content-Encoding', '') == 'deflate':
+        body = zlib.decompress(body, -zlib.MAX_WBITS)
+        headers['Content-Length'] = str(len(body))
+        del headers['Content-Encoding']
+    return method, url, headers, kwargs, body
+
+
+HTTP_CONNECTION_CACHE = collections.defaultdict(Queue.PriorityQueue)
 
 def application(environ, start_response):
     if environ['REQUEST_METHOD'] == 'GET':
         start_response('302 Found', [('Location', 'https://www.google.com')])
         raise StopIteration
 
-    wsgi_input = environ['wsgi.input']
-    input_data = wsgi_input.read(int(environ.get('CONTENT_LENGTH') or -1))
-
-    metadata_length, = struct.unpack('!h', input_data[:2])
-    metadata = zlib.decompress(input_data[2:2+metadata_length], -zlib.MAX_WBITS)
-    payload = input_data[2+metadata_length:]
-    headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
-    method = headers.pop('G-Method')
-    url = headers.pop('G-Url')
+    post_data = environ['wsgi.input'].read(int(environ.get('CONTENT_LENGTH') or -1))
+    method, url, headers, kwargs, body = decode_request(post_data)
     scheme, netloc, path, _, query, _ = urlparse.urlparse(url)
-    if query:
-        path += '?' + query
-
-    kwargs = {}
-    any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
-
-    if 'Content-Encoding' in headers:
-        if headers['Content-Encoding'] == 'deflate':
-            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
-            headers['Content-Length'] = str(len(payload))
-            del headers['Content-Encoding']
-
     cipher = XORCipher(__password__[0])
-    normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
 
-    if __password__ and __password__ != kwargs.get('password'):
+    if __password__ != kwargs.get('password'):
         start_response('403 Forbidden', [('Content-Type', 'text/html')])
         yield message_html('403 Wrong Password', 'Wrong Password(%s)' % kwargs.get('password'), detail='please edit proxy.ini')
         raise StopIteration
@@ -127,35 +137,45 @@ def application(environ, start_response):
                     except Queue.Empty:
                         connection = ConnectionType(netloc, timeout=timeout)
                         break
-                connection.request(method, path, body=payload, headers=headers)
-                response = connection.getresponse()
+                connection.request(method, '%s?%s' % (path, query) if query else path, body=body, headers=headers)
+                response = connection.getresponse(buffering=True)
                 break
             except Exception as e:
                 if i == fetchmax - 1:
                     raise
-        start_response('200 OK', [('Content-Type', __content_type__)])
+        need_encrypt = not response.getheader('Content-Type', '').startswith(('audio/', 'image/', 'video/', 'application/octet-stream'))
+        start_response('200 OK', [('Content-Type', __content_type__ if need_encrypt else 'image/x-png')])
         header_sent = True
         if response.getheader('Set-Cookie'):
             response.msg['Set-Cookie'] = normcookie(response.getheader('Set-Cookie'))
-        yield cipher.encrypt('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding')))
+        content = 'HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unknown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
+        if need_encrypt:
+            content = cipher.encrypt(content)
+        yield content
+        # bufsize = 32768 if int(response.getheader('Content-Length', 0)) > 512*1024 else 8192
+        bufsize = 8192
         while True:
-            data = response.read()
+            data = response.read(bufsize)
             if not data:
                 response.close()
-                HTTP_CONNECTION_CACHE[(scheme, netloc)].put((time.time(), connection))
+                if connection.sock:
+                    HTTP_CONNECTION_CACHE[(scheme, netloc)].put((time.time(), connection))
                 return
-            yield cipher.encrypt(data)
+            if need_encrypt:
+                data = cipher.encrypt(data)
+            yield data
+            del data
     except Exception as e:
+        import traceback
         if not header_sent:
             start_response('200 OK', [('Content-Type', __content_type__)])
         yield cipher.encrypt('HTTP/1.1 500 Internal Server Error\r\nContent-type: text/html\r\n\r\n')
-        yield cipher.encrypt(message_html('500 Internal Server Error', 'urlfetch %r failed' % url, detail=repr(e)))
+        yield cipher.encrypt(message_html('500 Internal Server Error', 'urlfetch %r: %r' % (url, e), '<pre>%s</pre>' % traceback.format_exc()))
         raise StopIteration
-
 
 try:
     import sae
-    application = sae.create_wsgi_app(app)
+    application = sae.create_wsgi_app(application)
 except ImportError:
     pass
 
@@ -166,21 +186,24 @@ except ImportError:
     pass
 
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s - - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
-    host, _, port = sys.argv[1].rpartition(':')
-    logging.info('local paas_application serving at %s:%s', host, port)
+def run_wsgi_app(address, app):
     try:
-        import gevent.wsgi
-        import gevent.monkey
-        gevent.monkey.patch_all()
-        server = gevent.wsgi.WSGIServer((host, int(port)), application)
-        server.serve_forever()
-    except ImportError:
-        from gunicorn.app.base import Application
-        class GunicornApplication(Application):
+        from gunicorn.app.wsgiapp import WSGIApplication
+        class GunicornApplication(WSGIApplication):
             def init(self, parser, opts, args):
-                return {'bind': '%s:%d' % (host, int(port))}
+                return {'bind': '%s:%d' % (address[0], int(address[1])),
+                        'workers': 2,
+                        'worker_class': 'gevent'}
             def load(self):
                 return application
         GunicornApplication().run()
+    except ImportError:
+        from gevent.wsgi import WSGIServer
+        WSGIServer(address, app).serve_forever()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s - - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
+    host, _, port = sys.argv[1].rpartition(':')
+    logging.info('local python application serving at %s:%s', host, port)
+    run_wsgi_app((host, int(port)), application)
