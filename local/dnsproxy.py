@@ -127,7 +127,7 @@ class DNSServer(gevent.server.DatagramServer):
                 for dnsserver in self.dns_v6_servers:
                     sock_v6.sendto(data, (dnsserver, 53))
                 timeout_at = time.time() + self.dns_timeout
-                replied_servers = set()
+                need_reply_servers = set(self.dns_servers)
                 while time.time() < timeout_at:
                     if reply_data:
                         break
@@ -140,9 +140,12 @@ class DNSServer(gevent.server.DatagramServer):
                             logging.warning('query qname=%r reply bad iplist=%r, continue', qname, iplist)
                             reply_data = ''
                             continue
-                        if reply.header.rcode and len(replied_servers) < len(self.dns_servers):
-                            replied_servers.add(reply_addr[0])
-                            logging.warning('query qname=%r reply nonzero rcode=%r, try wait other dnsservers=%r reply, continue', qname, reply.header.rcode, set(self.dnsservers)-replied_servers)
+                        if reply.header.rcode and need_reply_servers:
+                            try:
+                                need_reply_servers.remove(reply_addr[0])
+                            except KeyError:
+                                pass
+                            logging.warning('query qname=%r reply nonzero rcode=%r, wait other need_reply_servers=%s, continue', qname, reply.header.rcode, need_reply_servers)
                             reply_data = ''
                             continue
                         ttl = max(x.ttl for x in reply.rr) if reply.rr else 600
