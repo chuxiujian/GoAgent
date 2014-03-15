@@ -310,7 +310,7 @@ class CertUtil(object):
 
     @staticmethod
     def get_cert(commonname, sans=()):
-        if commonname.count('.') >= 2 and len(commonname.split('.')[-2]) > 4:
+        if commonname.count('.') >= 2 and [len(x) for x in reversed(commonname.split('.'))] > [2, 4]:
             commonname = '.'+commonname.partition('.')[-1]
         certfile = os.path.join(CertUtil.ca_certdir, commonname + '.crt')
         if os.path.exists(certfile):
@@ -672,12 +672,12 @@ class PacUtil(object):
                 if '/' not in line:
                     use_domain = True
                 else:
-                    if not line.startswith('http://'):
+                    if not line.startswith(('http://', 'https://')):
                         line = 'http://' + line
                     use_start = True
             elif '|' == line[0]:
                 line = line[1:]
-                if not line.startswith('http://'):
+                if not line.startswith(('http://', 'https://')):
                     line = 'http://' + line
                 use_start = True
             if line[-1] in ('^', '|'):
@@ -784,17 +784,24 @@ def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
             sock.close()
 
 
-def win32dns_query_dnsserver_list():
-    import re, ctypes, ctypes.wintypes, struct, socket
-    DNS_CONFIG_DNS_SERVER_LIST = 6
-    buf = ctypes.create_string_buffer(2048)
-    ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
-    ips = struct.unpack('I', buf[0:4])[0]
-    out = []
-    for i in xrange(ips):
-        start = (i+1) * 4
-        out.append(socket.inet_ntoa(buf[start:start+4]))
-    return out
+def get_dnsserver_list():
+    if os.name == 'nt':
+        import ctypes, ctypes.wintypes, struct, socket
+        DNS_CONFIG_DNS_SERVER_LIST = 6
+        buf = ctypes.create_string_buffer(2048)
+        ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
+        ips = struct.unpack('I', buf[0:4])[0]
+        out = []
+        for i in xrange(ips):
+            start = (i+1) * 4
+            out.append(socket.inet_ntoa(buf[start:start+4]))
+        return out
+    elif os.path.isfile('/etc/resolv.conf'):
+        with open('/etc/resolv.conf', 'rb') as fp:
+            return re.findall(r'(?m)^nameserver\s+(\S+)', fp.read())
+    else:
+        logging.warning("get_dnsserver_list failed: unsupport platform '%s-%s'", sys.platform, os.name)
+        return []
 
 
 def spawn_later(seconds, target, *args, **kwargs):
@@ -2692,6 +2699,11 @@ def pre_start():
                 error = u'某些安全软件(如 %s)可能和本软件存在冲突，造成 CPU 占用过高。\n如有此现象建议暂时退出此安全软件来继续运行GoAgent' % ','.join(softwares)
                 ctypes.windll.user32.MessageBoxW(None, error, title, 0)
                 #sys.exit(0)
+    if os.path.isfile('/proc/cpuinfo'):
+        with open('/proc/cpuinfo', 'rb') as fp:
+            m = re.search(r'(?im)(BogoMIPS|cpu MHz)\s+:\s+([\d\.]+)', fp.read())
+            if m and float(m.group(2)) < 1000:
+                http_util.max_window = common.GAE_WINDOW = 2
     if common.GAE_APPIDS[0] == 'goagent':
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
@@ -2706,7 +2718,7 @@ def pre_start():
         logging.error('dnslib not found, please put dnslib-0.8.3.egg to %r!', os.path.dirname(os.path.abspath(__file__)))
         sys.exit(-1)
     if os.name == 'nt' and not common.DNS_ENABLE:
-        any(common.DNS_SERVERS.insert(0, x) for x in [y for y in win32dns_query_dnsserver_list() if y not in common.DNS_SERVERS])
+        any(common.DNS_SERVERS.insert(0, x) for x in [y for y in get_dnsserver_list() if y not in common.DNS_SERVERS])
     if not OpenSSL:
         logging.warning('python-openssl not found, please install it!')
     if 'uvent.loop' in sys.modules and isinstance(gevent.get_hub().loop, __import__('uvent').loop.UVLoop):
