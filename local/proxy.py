@@ -36,7 +36,7 @@
 #      s2marine0         <s2marine0@gmail.com>
 #      Toshio Xiang      <snachx@gmail.com>
 
-__version__ = '3.1.5'
+__version__ = '3.1.6'
 
 import sys
 import os
@@ -569,11 +569,11 @@ class PacUtil(object):
         try:
             logging.info('try download %r to update_pacfile(%r)', common.PAC_GFWLIST, filename)
             autoproxy_content = base64.b64decode(opener.open(common.PAC_GFWLIST).read())
-            logging.info('%r downloaded, try convert it with autoproxy2pac', common.PAC_GFWLIST)
+            logging.info('%r downloaded, try convert it with autoproxy2pac_lite', common.PAC_GFWLIST)
             if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
-                jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.autoproxy2pac, (autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default))
+                jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.autoproxy2pac_lite, (autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default))
             else:
-                jsrule = PacUtil.autoproxy2pac(autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default)
+                jsrule = PacUtil.autoproxy2pac_lite(autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default)
             content += '\r\n' + jsrule + '\r\n'
             logging.info('%r downloaded and parsed', common.PAC_GFWLIST)
         except Exception as e:
@@ -617,6 +617,62 @@ class PacUtil(object):
                     jsLines.insert(0, jsLine)
         function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
         return function
+
+    @staticmethod
+    def autoproxy2pac_lite(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
+        """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+        direct_domain_set = set([])
+        proxy_domain_set = set([])
+        for line in content.splitlines()[1:]:
+            if line and not line.startswith(('!', '|!', '||!')):
+                use_proxy = True
+                if line.startswith("@@"):
+                    line = line[2:]
+                    use_proxy = False
+                domain = ''
+                if line.startswith('/') and line.endswith('/'):
+                    line = line[1:-1]
+                    if line.startswith('^https?:\\/\\/[^\\/]+') and re.match(r'^(\w|\\\-|\\\.)+$', line[18:]):
+                        domain = line[18:].replace(r'\.', '.')
+                    else:
+                        logging.warning('unsupport gfwlist regex: %r', line)
+                elif line.startswith('||'):
+                    domain = line[2:].lstrip('*').rstrip('/')
+                elif line.startswith('|'):
+                    domain = urlparse.urlparse(line[1:]).netloc.lstrip('*')
+                elif line.startswith(('http://', 'https://')):
+                    domain = urlparse.urlparse(line).netloc.lstrip('*')
+                elif re.search(r'^([\w\-\_\.]+)([\*\/]|$)', line):
+                    domain = re.split(r'[\*\/]', line)[0]
+                else:
+                    pass
+                if '*' in domain:
+                    domain = domain.split('*')[-1]
+                if not domain or re.match(r'^\w+$', domain):
+                    logging.debug('unsupport gfwlist rule: %r', line)
+                    continue
+                if use_proxy:
+                    proxy_domain_set.add(domain)
+                else:
+                    direct_domain_set.add(domain)
+        jsLines = ',\n'.join('%s"%s": 1' % (' '*indent, x.lstrip('.')) for x in proxy_domain_set)
+        template = '''\
+                    var domainsFor%s = {
+                    %s
+                    };
+                    function %s(url, host) {
+                        var lastPos;
+                        do {
+                            if (domainsFor%s.hasOwnProperty(host)) {
+                                return 'PROXY %s';
+                            }
+                            lastPos = host.indexOf('.') + 1;
+                            host = host.slice(lastPos);
+                        } while (lastPos >= 1);
+                        return '%s';
+                    }'''
+        template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
+        return template % (func_name, jsLines, func_name, func_name, proxy, default)
 
     @staticmethod
     def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
@@ -771,7 +827,8 @@ def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
                     for sock in ins:
                         reply_data, _ = sock.recvfrom(512)
                         reply = dnslib.DNSRecord.parse(reply_data)
-                        iplist = [str(x.rdata) for x in reply.rr if x.rtype == 1]
+                        rtypes = (1, 28) if sock is sock_v6 else (1,)
+                        iplist = [str(x.rdata) for x in reply.rr if x.rtype in rtypes]
                         if any(x in blacklist for x in iplist):
                             logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
                         else:
@@ -1227,12 +1284,18 @@ class HTTPUtil(object):
 
     def _request(self, sock, method, path, protocol_version, headers, payload, bufsize=8192, crlf=None, return_sock=None):
         skip_headers = self.skip_headers
-        need_crlf = bool(crlf)
-        if need_crlf:
-            fakehost = 'www.' + ''.join(random.choice(('bcdfghjklmnpqrstvwxyz','aeiou')[x&1]) for x in xrange(random.randint(5,20))) + random.choice(['.net', '.com', '.org'])
-            request_data = 'GET / HTTP/1.1\r\nHost: %s\r\n\r\n\r\n\r\r' % fakehost
-        else:
-            request_data = ''
+        request_data = ''
+        crlf_counter = 0
+        if crlf:
+            fakeheaders = dict((k.title(), v) for k, v in headers.items())
+            fakeheaders['Host'] = 'www.google.cn'
+            fakeheaders['Cookie'] = ''.join(random.choice(string.letters) for _ in xrange(random.randint(800, 1000)))
+            fakeheaders.pop('Content-Length', None)
+            fakeheaders_data = ''.join('%s: %s\r\n' % (k, v) for k, v in fakeheaders.items() if k not in skip_headers)
+            while crlf_counter < 2 or len(request_data) < 1500:
+                request_data += 'GET / HTTP/1.1\r\n%s\r\n' % fakeheaders_data
+                crlf_counter += 1
+            request_data += '\r\n\r\n\r\n'
         request_data += '%s %s %s\r\n' % (method, path, protocol_version)
         request_data += ''.join('%s: %s\r\n' % (k.title(), v) for k, v in headers.items() if k.title() not in skip_headers)
         if self.proxy:
@@ -1253,14 +1316,16 @@ class HTTPUtil(object):
         else:
             raise TypeError('http_util.request(payload) must be a string or buffer, not %r' % type(payload))
 
-        if need_crlf:
-            try:
-                response = httplib.HTTPResponse(sock)
+        try:
+            while crlf_counter:
+                response = httplib.HTTPResponse(sock, buffering=False)
                 response.begin()
                 response.read()
-            except Exception:
-                logging.exception('crlf skip read')
-                return None
+                response.close()
+                crlf_counter -= 1
+        except Exception as e:
+            logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
+            return None
 
         if return_sock:
             return sock
@@ -1367,6 +1432,13 @@ class Common(object):
         self.HTTP_CRLFSITES = tuple(self.CONFIG.get(http_section, 'crlfsites').split('|'))
         self.HTTP_FORCEHTTPS = set(self.CONFIG.get(http_section, 'forcehttps').split('|'))
         self.HTTP_FAKEHTTPS = set(self.CONFIG.get(http_section, 'fakehttps').split('|'))
+        self.HTTP_DNS = self.CONFIG.get(http_section, 'dns').split('|') if self.CONFIG.has_option(http_section, 'dns') else []
+        # for hostname in [k for k, _ in self.CONFIG.items(hosts_section) if k.startswith(('https://', 'https?://'))]:
+        #     m = re.search(r'(?<=//)(\-|\_|\w|\\.)+(?=/)', hostname)
+        #     if m:
+        #         host = m.group().replace('\\.', '.')
+        #         self.HTTP_FAKEHTTPS.add(host)
+        #         logging.info('add host=%r to fakehttps', host)
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|')) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOSTS_MAP.items() if k == v)
@@ -1424,7 +1496,7 @@ class Common(object):
 
         self.DNS_ENABLE = self.CONFIG.getint('dns', 'enable')
         self.DNS_LISTEN = self.CONFIG.get('dns', 'listen')
-        self.DNS_SERVERS = self.CONFIG.get('dns', 'servers').split('|')
+        self.DNS_SERVERS = self.HTTP_DNS or self.CONFIG.get('dns', 'servers').split('|')
         self.DNS_BLACKLIST = set(self.CONFIG.get('dns', 'blacklist').split('|'))
 
         self.USERAGENT_ENABLE = self.CONFIG.getint('useragent', 'enable')
@@ -2025,7 +2097,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 finally:
                     logging.info('%r matched local file %r, return', self.path, filename)
                     return
-            need_crlf = hostname.startswith('google_') or host.endswith(common.HTTP_CRLFSITES)
+            need_crlf = host.endswith(common.HTTP_CRLFSITES)
             hostname = hostname or host
             if hostname in common.IPLIST_MAP:
                 http_util.dns[host] = common.IPLIST_MAP[hostname]
@@ -2337,10 +2409,11 @@ def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     metadata = 'G-Method:%s\nG-Url:%s\n%s%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v), ''.join('%s:%s\n' % (k, v) for k, v in headers.items() if k not in skip_headers))
     metadata = zlib.compress(metadata)[2:-4]
     app_payload = b''.join((struct.pack('!h', len(metadata)), metadata, payload))
+    app_headers = {'Content-Length': len(app_payload), 'Content-Type': 'application/octet-stream'}
     fetchserver += '?%s' % random.random()
     crlf = 0 if fetchserver.startswith('https') else common.PHP_CRLF
     connection_cache_key = '%s//:%s' % urlparse.urlparse(fetchserver)[:2]
-    response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=crlf, connection_cache_key=connection_cache_key)
+    response = http_util.request('POST', fetchserver, app_payload, app_headers, crlf=crlf, connection_cache_key=connection_cache_key)
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
@@ -2703,7 +2776,7 @@ def pre_start():
         with open('/proc/cpuinfo', 'rb') as fp:
             m = re.search(r'(?im)(BogoMIPS|cpu MHz)\s+:\s+([\d\.]+)', fp.read())
             if m and float(m.group(2)) < 1000:
-                http_util.max_window = common.GAE_WINDOW = 2
+                logging.warning("*NOTE*, Please set [gae]window=2")
     if common.GAE_APPIDS[0] == 'goagent':
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
