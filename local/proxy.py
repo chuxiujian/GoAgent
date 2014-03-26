@@ -700,7 +700,8 @@ class PacUtil(object):
     @staticmethod
     def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
-        jsLines = []
+        white_conditions = []
+        black_conditions = []
         for line in content.splitlines()[1:]:
             if not line or line.startswith('!') or '##' in line or '#@#' in line:
                 continue
@@ -740,60 +741,65 @@ class PacUtil(object):
                 line = line[:-1]
                 if not use_postfix:
                     use_end = True
-            return_proxy = 'PROXY %s' % proxy if use_proxy else default
             line = line.replace('^', '*').strip('*')
             if use_start and use_end:
                 if '*' in line:
-                    jsLine = 'if (shExpMatch(url, "%s")) return "%s";' % (line, return_proxy)
+                    jsCondition = ['shExpMatch(url, "%s")' % line]
                 else:
-                    jsLine = 'if (url == "%s") return "%s";' % (line, return_proxy)
+                    jsCondition = ['url == "%s"' % line]
             elif use_start:
                 if '*' in line:
                     if use_postfix:
-                        jsCondition = ' || '.join('shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix)
-                        jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        jsCondition = ['shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix]
                     else:
-                        jsLine = 'if (shExpMatch(url, "%s*")) return "%s";' % (line, return_proxy)
+                        jsCondition = ['shExpMatch(url, "%s*")' % line]
                 else:
-                    jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line, return_proxy)
+                    jsCondition = ['url.indexOf("%s") == 0' % line]
             elif use_domain and use_end:
                 if '*' in line:
-                    jsLine = 'if (shExpMatch(host, "%s*")) return "%s";' % (line, return_proxy)
+                    jsCondition = ['shExpMatch(host, "%s*")' % line]
                 else:
-                    jsLine = 'if (host == "%s") return "%s";' % (line, return_proxy)
+                    jsCondition = ['host == "%s"' % line]
             elif use_domain:
                 if line.split('/')[0].count('.') <= 1:
                     if use_postfix:
-                        jsCondition = ' || '.join('shExpMatch(url, "http://*.%s*%s")' % (line, x) for x in use_postfix)
-                        jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        jsCondition = ['shExpMatch(url, "http://*.%s*%s")' % (line, x) for x in use_postfix]
                     else:
-                        jsLine = 'if (shExpMatch(url, "http://*.%s*")) return "%s";' % (line, return_proxy)
+                        jsCondition = ['shExpMatch(url, "http://*.%s*")' % line]
                 else:
                     if '*' in line:
                         if use_postfix:
-                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
-                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                            jsCondition = ['shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix]
                         else:
-                            jsLine = 'if (shExpMatch(url, "http://%s*")) return "%s";' % (line, return_proxy)
+                            jsCondition = ['shExpMatch(url, "http://%s*")' % line]
                     else:
                         if use_postfix:
-                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
-                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                            jsCondition = ['shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix]
                         else:
-                            jsLine = 'if (url.indexOf("http://%s") == 0) return "%s";' % (line, return_proxy)
+                            jsCondition = ['url.indexOf("http://%s") == 0' % line]
             else:
                 if use_postfix:
-                    jsCondition = ' || '.join('shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix)
-                    jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                    jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
                 else:
-                    jsLine = 'if (shExpMatch(url, "*%s*")) return "%s";' % (line, return_proxy)
-            jsLine = ' ' * indent + jsLine.replace('**', '*')
+                    jsCondition = ['shExpMatch(url, "*%s*")' % line]
             if use_proxy:
-                jsLines.append(jsLine)
+                black_conditions += jsCondition
             else:
-                jsLines.insert(0, jsLine)
-        function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
-        return function
+                white_conditions += jsCondition
+        black_lines = ' ||\r\n'.join('%s%s' % (' '*(4+indent), x.replace('**', '*')) for x in black_conditions).strip()
+        white_lines = ' ||\r\n'.join('%s%s' % (' '*(4+indent), x.replace('**', '*')) for x in white_conditions).strip()
+        template = '''\
+                    function %s(url, host) {
+                        if (%s) {
+                            return "%s";
+                        }
+                        if (%s) {
+                            return "PROXY %s";
+                        }
+                        return "%s";
+                    }'''
+        template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
+        return template % (func_name, white_lines, default, black_lines, proxy, default)
 
 
 def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
@@ -2109,7 +2115,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not response:
                 return
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+            self.wfile.write(('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
             while True:
                 data = response.read(8192)
                 if not data:
@@ -2205,7 +2211,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     continue
                 if response.app_status != 200 and retry == common.FETCHMAX_LOCAL-1:
                     logging.info('%s "GAE %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-                    self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+                    self.wfile.write(('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
                     self.wfile.write(response.read())
                     response.close()
                     return
@@ -2220,7 +2226,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
                     if response.getheader('Content-Disposition') and '"' not in response.getheader('Content-Disposition'):
                         response.msg['Content-Disposition'] = self.normattachment(response.getheader('Content-Disposition'))
-                    headers_data = 'HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
+                    headers_data = 'HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
                     logging.debug('headers_data=%s', headers_data)
                     #self.wfile.write(headers_data.encode() if bytes is not str else headers_data)
                     self.wfile.write(headers_data)
@@ -2509,7 +2515,7 @@ class PHPProxyHandler(GAEProxyHandler):
 
             logging.info('%s "PHP %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
             if response.status != 200:
-                self.wfile.write('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
+                self.wfile.write('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
 
             cipher = response.status == 200 and response.getheader('Content-Type', '') == 'image/gif' and XORCipher(common.PHP_PASSWORD[0])
             while True:
