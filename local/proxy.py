@@ -1295,6 +1295,7 @@ class HTTPUtil(object):
             fakeheaders = dict((k.title(), v) for k, v in headers.items())
             fakeheaders.pop('Content-Length', None)
             fakeheaders.pop('Cookie', None)
+            fakeheaders.pop('Host', None)
             if 'User-Agent' not in fakeheaders:
                 fakeheaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1878.0 Safari/537.36'
             if 'Accept-Language' not in fakeheaders:
@@ -1393,6 +1394,16 @@ class HTTPUtil(object):
                     continue
 
 
+class SimpleProxyHandlerFilter(object):
+    """simple proxy handler filter"""
+    def filter(self, handler):
+        if handler.command == 'CONNECT':
+            hostname, _, port = handler.path.partition(':')
+            return [handler.do_METHOD_FORWARD, hostname, int(port), 20]
+        else:
+            return [handler.do_METHOD_URLFETCH, None]
+
+
 class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """SimpleProxyHandler for GoAgent 3.x"""
 
@@ -1401,7 +1412,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
     normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
     bufsize = 256 * 1024
+    max_timeout = 16
     first_run_lock = threading.Lock()
+    handler_filters = [SimpleProxyHandlerFilter()]
 
     def __init__(self, *args, **kwargs):
         BaseHTTPServer.BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
@@ -1439,18 +1452,18 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def first_run(self):
         pass
 
-    def __gethostbyname2(self, hostname):
+    def gethostbyname2(self, hostname):
         return socket.gethostbyname_ex(hostname)[-1]
 
-    def __create_connection(self, hostname, port, timeout, **kwargs):
+    def create_tcp_connection(self, hostname, port, timeout, **kwargs):
         return socket.create_connection((hostname, port), timeout)
 
-    def __create_ssl_connection(self, hostname, port, timeout, **kwargs):
-        sock = self.__create_connection(hostname, port, timeout, **kwargs)
+    def create_ssl_connection(self, hostname, port, timeout, **kwargs):
+        sock = self.create_tcp_connection(hostname, port, timeout, **kwargs)
         ssl_sock = ssl.wrap_socket(sock)
         return ssl_sock
 
-    def __create_http_request(self, method, url, body=None, headers={}, realhost='', timeout=16, max_retry=3, bufsize=8192, crlf=None, validate=None, connection_cache_key=None):
+    def create_http_request(self, method, url, headers, body, timeout, **kwargs):
         scheme, netloc, path, query, _ = urlparse.urlsplit(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
@@ -1465,72 +1478,14 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             headers['Host'] = host
         if body and 'Content-Length' not in headers:
             headers['Content-Length'] = str(len(body))
-        sock = None
-        errors = []
-        for _ in range(max_retry):
-            try:
-                create_connection = self.__create_ssl_connection if scheme == 'https' else self.__create_connection
-                sock = create_connection(realhost or host, port, timeout, validate=validate, cache_key=connection_cache_key)
-                if sock and not isinstance(sock, Exception):
-                    break
-            except Exception as e:
-                logging.debug('__create_http_request "%s %s" failed:%s', method, url, e)
-                errors.append(e)
-                continue
-        if not sock and errors:
-            raise errors[-1]
-        request_data = ''
-        crlf_counter = 0
-        if scheme != 'https' and crlf:
-            fakeheaders = dict((k.title(), v) for k, v in headers.items())
-            fakeheaders.pop('Content-Length', None)
-            fakeheaders.pop('Cookie', None)
-            if 'User-Agent' not in fakeheaders:
-                fakeheaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1878.0 Safari/537.36'
-            if 'Accept-Language' not in fakeheaders:
-                fakeheaders['Accept-Language'] = 'zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4'
-            if 'Accept' not in fakeheaders:
-                fakeheaders['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-            fakeheaders_data = ''.join('%s: %s\r\n' % (k, v) for k, v in fakeheaders.items() if k not in self.skip_headers)
-            while crlf_counter < 5 or len(request_data) < 1500 * 2:
-                request_data += 'GET / HTTP/1.1\r\n%s\r\n' % fakeheaders_data
-                crlf_counter += 1
-            request_data += '\r\n\r\n\r\n'
-        request_data += '%s %s %s\r\n' % (method, path, self.protocol_version)
-        request_data += ''.join('%s: %s\r\n' % (k.title(), v) for k, v in headers.items() if k.title() not in self.skip_headers)
-        request_data += '\r\n'
-        if isinstance(body, bytes):
-            sock.sendall(request_data.encode() + body)
-        elif hasattr(body, 'read'):
-            sock.sendall(request_data)
-            while 1:
-                data = body.read(bufsize)
-                if not data:
-                    break
-                sock.sendall(data)
-        else:
-            raise TypeError('http_util.request(body) must be a string or buffer, not %r' % type(body))
-        try:
-            while crlf_counter:
-                response = httplib.HTTPResponse(sock, buffering=False)
-                response.begin()
-                response.read()
-                response.close()
-                crlf_counter -= 1
-        except Exception as e:
-            logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
-            return None
-        response = httplib.HTTPResponse(sock, buffering=True)
-        try:
-            response.begin()
-        except httplib.BadStatusLine:
-            response = None
+        ConnectionType = httplib.HTTPSConnection if scheme == 'https' else httplib.HTTPConnection
+        connection = ConnectionType(netloc, timeout=timeout)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse(buffering=True)
         return response
 
-    def __urlfetch(self, method, url, headers, body, fetchserver, **kwargs):
-        assert fetchserver
-        response = self.__create_http_request(method, url, body=body, headers=headers)
-        return response
+    def create_http_request_withserver(self, fetchserver, method, url, headers, body, timeout, **kwargs):
+        raise NotImplementedError
 
     def do_METHOD_MOCK(self, status, headers, content):
         """mock response"""
@@ -1583,13 +1538,14 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
                 raise
 
-    def do_METHOD_FORWARD(self, hostname, port, timeout, do_ssl_handshake=False):
+    def do_METHOD_FORWARD(self, hostname, port, timeout, kwargs={}):
         """forward socket"""
+        do_ssl_handshake = kwargs.pop('do_ssl_handshake', False)
         local = self.connection
         if do_ssl_handshake:
-            remote = self.__create_ssl_connection(hostname, port, timeout)
+            remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
         else:
-            remote = self.__create_connection(hostname, port, timeout)
+            remote = self.create_tcp_connection(hostname, port, timeout, **kwargs)
         if remote and not isinstance(remote, Exception):
             self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
         logging.info('%s "FORWARD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
@@ -1625,13 +1581,16 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if remote:
                 remote.close()
 
-    def do_METHOD_URLFETCH(self, fetchserver, **kwargs):
+    def do_METHOD_URLFETCH(self, fetchserver, kwargs={}):
         """urlfetch from fetchserver"""
         method = self.command
         url = self.path
         headers = {k.title(): v for k, v in self.headers.items()}
         body = self.rfile.read(int(headers.get('Content-Length', 0)))
-        response = self.__urlfetch(method, url, headers, body, fetchserver, **kwargs)
+        if fetchserver:
+            response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=16, **kwargs)
+        else:
+            response = self.create_http_request(method, url, headers, body, timeout=16, **kwargs)
         logging.info('%s "URLFETCH %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
         response_headers = {k.title(): v for k, v in response.getheaders()}
         if 'Set-Cookie' in response_headers:
@@ -1653,11 +1612,347 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         response.close()
 
     def do_METHOD(self):
-        if self.command == 'CONNECT':
-            hostname, _, port = self.path.partition(':')
-            return self.do_METHOD_FORWARD(hostname, int(port), 60)
+        for handler_filter in self.handler_filters:
+            action = handler_filter.filter(self)
+            if action:
+                return action.pop(0)(*action)
+
+
+class ProxyChainMixin:
+    """proxy chain mixin"""
+    proxy = ''
+
+    def gethostbyname2(self, hostname):
+        return [hostname]
+
+    def create_tcp_connection(self, hostname, port, timeout, **kwargs):
+        _, proxyuser, proxypass, proxyaddress = ProxyUtil.parse_proxy(self.proxy)
+        proxyhost, _, proxyport = proxyaddress.rpartition(':')
+        sock = socket.create_connection((proxyhost, int(proxyport)))
+        request_data = 'CONNECT %s:%s HTTP/1.1\r\n' % (hostname, port)
+        if proxyuser and proxypass:
+            request_data += 'Proxy-authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (proxyuser, proxypass)).encode()).decode().strip()
+        request_data += '\r\n'
+        sock.sendall(request_data)
+        response = httplib.HTTPResponse(sock, buffering=False)
+        response.begin()
+        if response.status >= 400:
+            raise httplib.BadStatusLine('%s %s %s' % (response.version, response.status, response.reason))
+        return sock
+
+    def create_ssl_connection(self, hostname, port, timeout, **kwargs):
+        sock = self.create_tcp_connection(hostname, port, timeout, **kwargs)
+        ssl_sock = ssl.wrap_socket(sock)
+        return ssl_sock
+
+
+class AdvancedProxyHandler(SimpleProxyHandler):
+    """Advanced Proxy Handler"""
+    dns_cache = LRUCache(64*1024)
+    tcp_connection_time = collections.defaultdict(float)
+    tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
+    ssl_connection_time = collections.defaultdict(float)
+    ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
+    max_window = 4
+
+    def gethostbyname2(self, hostname):
+        try:
+            iplist = self.dns_cache[hostname]
+        except KeyError:
+            self.dns_cache[hostname] = iplist = socket.gethostbyname_ex(hostname)[-1]
+        return iplist
+
+    def create_tcp_connection(self, hostname, port, timeout, **kwargs):
+        connection_cache_key = kwargs.get('cache_key')
+        def create_connection(ipaddr, timeout, queobj):
+            sock = None
+            try:
+                # create a ipv4/ipv6 socket object
+                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                # set reuseaddr option to avoid 10048 socket error
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # resize socket recv buffer 8K->32K to improve browser releated application performance
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
+                # disable nagle algorithm to send http request quickly.
+                sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
+                # set a short timeout to trigger timeout retry more quickly.
+                sock.settimeout(timeout or self.max_timeout)
+                # start connection time record
+                start_time = time.time()
+                # TCP connect
+                sock.connect(ipaddr)
+                # record TCP connection time
+                self.tcp_connection_time[ipaddr] = time.time() - start_time
+                # put ssl socket object to output queobj
+                queobj.put(sock)
+            except (socket.error, OSError) as e:
+                # any socket.error, put Excpetions to output queobj.
+                queobj.put(e)
+                # reset a large and random timeout to the ipaddr
+                self.tcp_connection_time[ipaddr] = self.max_timeout+random.random()
+                # close tcp socket
+                if sock:
+                    sock.close()
+        def close_connection(count, queobj):
+            for i in range(count):
+                sock = queobj.get()
+                if sock and not isinstance(sock, Exception):
+                    if connection_cache_key and i == 0:
+                        self.tcp_connection_cache[connection_cache_key].put((time.time(), sock))
+                    else:
+                        sock.close()
+        try:
+            while connection_cache_key:
+                ctime, sock = self.tcp_connection_cache[connection_cache_key].get_nowait()
+                if time.time() - ctime < 30:
+                    return sock
+        except Queue.Empty:
+            pass
+        result = None
+        addresses = [(x, port) for x in self.gethostbyname2(hostname)]
+        if port == 443:
+            get_connection_time = lambda addr: self.ssl_connection_time.__getitem__(addr) or self.tcp_connection_time.__getitem__(addr)
         else:
-            return self.do_METHOD_URLFETCH('dummyserver')
+            get_connection_time = self.tcp_connection_time.__getitem__
+        for i in range(3):
+            window = min((self.max_window+1)//2 + min(i, 1), len(addresses))
+            addresses.sort(key=get_connection_time)
+            addrs = addresses[:window] + random.sample(addresses, min(len(addresses), window, self.max_window-window))
+            queobj = Queue.Queue()
+            for addr in addrs:
+                thread.start_new_thread(create_connection, (addr, timeout, queobj))
+            for i in range(len(addrs)):
+                result = queobj.get()
+                if not isinstance(result, (socket.error, OSError)):
+                    thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj))
+                    return result
+                else:
+                    if i == 0:
+                        # only output first error
+                        logging.warning('create_connection to %s return %r, try again.', addrs, result)
+
+    def create_ssl_connection(self, hostname, port, timeout, **kwargs):
+        connection_cache_key = kwargs.get('cache_key')
+        validate = kwargs.get('validate')
+        def create_connection(ipaddr, timeout, queobj):
+            sock = None
+            ssl_sock = None
+            try:
+                # create a ipv4/ipv6 socket object
+                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                # set reuseaddr option to avoid 10048 socket error
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # resize socket recv buffer 8K->32K to improve browser releated application performance
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
+                # disable negal algorithm to send http request quickly.
+                sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
+                # set a short timeout to trigger timeout retry more quickly.
+                sock.settimeout(timeout or self.max_timeout)
+                # pick up the certificate
+                if not validate:
+                    ssl_sock = ssl.wrap_socket(sock, do_handshake_on_connect=False)
+                else:
+                    ssl_sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_REQUIRED, ca_certs=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cacert.pem'), do_handshake_on_connect=False)
+                ssl_sock.settimeout(timeout or self.max_timeout)
+                # start connection time record
+                start_time = time.time()
+                # TCP connect
+                ssl_sock.connect(ipaddr)
+                connected_time = time.time()
+                # SSL handshake
+                ssl_sock.do_handshake()
+                handshaked_time = time.time()
+                # record TCP connection time
+                self.tcp_connection_time[ipaddr] = ssl_sock.tcp_time = connected_time - start_time
+                # record SSL connection time
+                self.ssl_connection_time[ipaddr] = ssl_sock.ssl_time = handshaked_time - start_time
+                ssl_sock.ssl_time = connected_time - start_time
+                # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
+                ssl_sock.sock = sock
+                # verify SSL certificate.
+                if validate and hostname.endswith('.appspot.com'):
+                    cert = ssl_sock.getpeercert()
+                    orgname = next((v for ((k, v),) in cert['subject'] if k == 'organizationName'))
+                    if not orgname.lower().startswith('google '):
+                        raise ssl.SSLError("%r certificate organizationName(%r) not startswith 'Google'" % (hostname, orgname))
+                # put ssl socket object to output queobj
+                queobj.put(ssl_sock)
+            except (socket.error, ssl.SSLError, OSError) as e:
+                # any socket.error, put Excpetions to output queobj.
+                queobj.put(e)
+                # reset a large and random timeout to the ipaddr
+                self.ssl_connection_time[ipaddr] = self.max_timeout + random.random()
+                # close ssl socket
+                if ssl_sock:
+                    ssl_sock.close()
+                # close tcp socket
+                if sock:
+                    sock.close()
+        def create_connection_withopenssl(ipaddr, timeout, queobj):
+            sock = None
+            ssl_sock = None
+            try:
+                # create a ipv4/ipv6 socket object
+                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                # set reuseaddr option to avoid 10048 socket error
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # resize socket recv buffer 8K->32K to improve browser releated application performance
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
+                # disable negal algorithm to send http request quickly.
+                sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
+                # set a short timeout to trigger timeout retry more quickly.
+                sock.settimeout(timeout or self.max_timeout)
+                # pick up the certificate
+                server_hostname = b'www.google.com' if hostname.endswith('.appspot.com') else None
+                ssl_sock = SSLConnection(self.openssl_context, sock)
+                ssl_sock.set_connect_state()
+                if server_hostname:
+                    ssl_sock.set_tlsext_host_name(server_hostname)
+                # start connection time record
+                start_time = time.time()
+                # TCP connect
+                ssl_sock.connect(ipaddr)
+                connected_time = time.time()
+                # SSL handshake
+                ssl_sock.do_handshake()
+                handshaked_time = time.time()
+                # record TCP connection time
+                self.tcp_connection_time[ipaddr] = ssl_sock.tcp_time = connected_time - start_time
+                # record SSL connection time
+                self.ssl_connection_time[ipaddr] = ssl_sock.ssl_time = handshaked_time - start_time
+                # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
+                ssl_sock.sock = sock
+                # verify SSL certificate.
+                if validate and hostname.endswith('.appspot.com'):
+                    cert = ssl_sock.get_peer_certificate()
+                    commonname = next((v for k, v in cert.get_subject().get_components() if k == 'CN'))
+                    if '.google' not in commonname and not commonname.endswith('.appspot.com'):
+                        raise socket.error("Host name '%s' doesn't match certificate host '%s'" % (hostname, commonname))
+                # put ssl socket object to output queobj
+                queobj.put(ssl_sock)
+            except (socket.error, OpenSSL.SSL.Error, OSError) as e:
+                # any socket.error, put Excpetions to output queobj.
+                queobj.put(e)
+                # reset a large and random timeout to the ipaddr
+                self.ssl_connection_time[ipaddr] = self.max_timeout + random.random()
+                # close ssl socket
+                if ssl_sock:
+                    ssl_sock.close()
+                # close tcp socket
+                if sock:
+                    sock.close()
+        def close_connection(count, queobj, first_tcp_time, first_ssl_time):
+            for _ in range(count):
+                sock = queobj.get()
+                ssl_time_threshold = min(1, 1.5 * first_ssl_time)
+                if sock and not isinstance(sock, Exception):
+                    if connection_cache_key and sock.ssl_time < ssl_time_threshold:
+                        self.ssl_connection_cache[connection_cache_key].put((time.time(), sock))
+                    else:
+                        sock.close()
+        try:
+            while connection_cache_key:
+                ctime, sock = self.ssl_connection_cache[connection_cache_key].get_nowait()
+                if time.time() - ctime < 30:
+                    return sock
+        except Queue.Empty:
+            pass
+        result = None
+        addresses = [(x, port) for x in self.gethostbyname2(hostname)]
+        for i in range(3):
+            window = min((self.max_window+1)//2 + min(i, 1), len(addresses))
+            addresses.sort(key=self.ssl_connection_time.__getitem__)
+            addrs = addresses[:window] + random.sample(addresses, min(len(addresses), window, self.max_window-window))
+            queobj = Queue.Queue()
+            for addr in addrs:
+                thread.start_new_thread(create_connection, (addr, timeout, queobj))
+            for i in range(len(addrs)):
+                result = queobj.get()
+                if not isinstance(result, Exception):
+                    thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, result.tcp_time, result.ssl_time))
+                    return result
+                else:
+                    if i == 0:
+                        # only output first error
+                        logging.warning('create_ssl_connection to %s return %r, try again.', addrs, result)
+
+    def create_http_request(self, method, url, headers, body, timeout, realhost='', max_retry=3, bufsize=8192, crlf=None, validate=None, connection_cache_key=None):
+        scheme, netloc, path, query, _ = urlparse.urlsplit(url)
+        if netloc.rfind(':') <= netloc.rfind(']'):
+            # no port number
+            host = netloc
+            port = 443 if scheme == 'https' else 80
+        else:
+            host, _, port = netloc.rpartition(':')
+            port = int(port)
+        if query:
+            path += '?' + query
+        if 'Host' not in headers:
+            headers['Host'] = host
+        if body and 'Content-Length' not in headers:
+            headers['Content-Length'] = str(len(body))
+        sock = None
+        errors = []
+        for _ in range(max_retry):
+            try:
+                create_connection = self.create_ssl_connection if scheme == 'https' else self.create_tcp_connection
+                sock = create_connection(realhost or host, port, timeout, validate=validate, cache_key=connection_cache_key)
+                if sock and not isinstance(sock, Exception):
+                    break
+            except Exception as e:
+                logging.exception('create_http_request "%s %s" failed:%s', method, url, e)
+                errors.append(e)
+                continue
+        if not sock and errors:
+            raise errors[-1]
+        request_data = ''
+        crlf_counter = 0
+        if scheme != 'https' and crlf:
+            fakeheaders = dict((k.title(), v) for k, v in headers.items())
+            fakeheaders.pop('Content-Length', None)
+            fakeheaders.pop('Cookie', None)
+            fakeheaders.pop('Host', None)
+            if 'User-Agent' not in fakeheaders:
+                fakeheaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1878.0 Safari/537.36'
+            if 'Accept-Language' not in fakeheaders:
+                fakeheaders['Accept-Language'] = 'zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4'
+            if 'Accept' not in fakeheaders:
+                fakeheaders['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            fakeheaders_data = ''.join('%s: %s\r\n' % (k, v) for k, v in fakeheaders.items() if k not in self.skip_headers)
+            while crlf_counter < 5 or len(request_data) < 1500 * 2:
+                request_data += 'GET / HTTP/1.1\r\n%s\r\n' % fakeheaders_data
+                crlf_counter += 1
+            request_data += '\r\n\r\n\r\n'
+        request_data += '%s %s %s\r\n' % (method, path, self.protocol_version)
+        request_data += ''.join('%s: %s\r\n' % (k.title(), v) for k, v in headers.items() if k.title() not in self.skip_headers)
+        request_data += '\r\n'
+        if isinstance(body, bytes):
+            sock.sendall(request_data.encode() + body)
+        elif hasattr(body, 'read'):
+            sock.sendall(request_data)
+            while 1:
+                data = body.read(bufsize)
+                if not data:
+                    break
+                sock.sendall(data)
+        else:
+            raise TypeError('http_util.request(body) must be a string or buffer, not %r' % type(body))
+        try:
+            while crlf_counter:
+                response = httplib.HTTPResponse(sock, buffering=False)
+                response.begin()
+                response.read()
+                response.close()
+                crlf_counter -= 1
+        except Exception as e:
+            logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
+            return None
+        response = httplib.HTTPResponse(sock, buffering=True)
+        try:
+            response.begin()
+        except httplib.BadStatusLine:
+            response = None
+        return response
 
 
 class Common(object):
@@ -2269,7 +2564,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     urlfetch = staticmethod(gae_urlfetch)
     normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
     normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
-    geoip = pygeoip.GeoIP('GeoIP.dat') if pygeoip and common.GAE_REGIONS else None
+    geoip = pygeoip.GeoIP(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeoIP.dat')) if pygeoip and common.GAE_REGIONS else None
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
@@ -2691,6 +2986,146 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self.__realconnection = None
 
 
+class WithGAEFilter(SimpleProxyHandlerFilter):
+    """with gae filter"""
+    def filter(self, handler):
+        if (handler.command != 'CONNECT' and handler.headers.get('Host') in common.HTTP_WITHGAE) or \
+           (handler.command == 'CONNECT' and handler.path.partition(':')[0] in common.HTTP_WITHGAE):
+            fetchserver = '%s://%s.appspot.com%s' % (common.GAE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
+            return [handler.do_METHOD_URLFETCH, fetchserver]
+
+
+class ForceHttpsFilter(SimpleProxyHandlerFilter):
+    """force https filter"""
+    def filter(self, handler):
+        if handler.command != 'CONNECT' and handler.headers.get('Host') in common.HTTP_FORCEHTTPS and not handler.headers.get('Referer', '').startswith('https://') and not handler.path.startswith('https://'):
+            logging.debug('ForceHttpsFilter metched %r %r', handler.path, handler.headers)
+            return [handler.do_METHOD_MOCK, 301, {'Location': handler.path.replace('http://', 'https://', 1)}, '']
+
+
+class FakeHttpsFilter(SimpleProxyHandlerFilter):
+    """fake https filter"""
+    def filter(self, handler):
+        if handler.command == 'CONNECT' and handler.path.partition(':')[0] in common.HTTP_FAKEHTTPS:
+            return [handler.do_METHOD_STRIPSSL]
+
+
+class HostsFilter(SimpleProxyHandlerFilter):
+    """force https filter"""
+    def filter(self, handler):
+        if handler.command == 'CONNECT':
+            host, _, port = handler.path.partition(':')
+            if handler.path in common.CONNECT_HOSTS_MAP or handler.path.endswith(common.CONNECT_POSTFIX_ENDSWITH) or host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
+                return [handler.do_METHOD_FORWARD, host, int(port), handler.max_timeout]
+        else:
+            host = urlparse.urlsplit(handler.path).netloc.rsplit(':', 1)[0].strip('[]')
+            if any(x(handler.path) for x in common.METHOD_REMATCH_MAP) or host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
+                return [handler.do_METHOD_URLFETCH, None]
+
+
+class DirectRegionFilter(SimpleProxyHandlerFilter):
+    """direct region filter"""
+    geoip = pygeoip.GeoIP(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeoIP.dat')) if pygeoip and common.GAE_REGIONS else None
+
+    def is_direct_regions(self, handler, hostname):
+        iplist = handler.gethostbyname2()
+        country_code = self.geoip.country_code_by_addr(iplist[0])
+        return country_code in common.GAE_REGIONS
+
+    def filter(self, handler):
+        if handler.command == 'CONNECT':
+            hostname, _, port = handler.path.partition(':')
+            if self.is_direct_regions(handler, hostname):
+                return [handler.do_METHOD_FORWARD, hostname, int(port), handler.max_timeout]
+        else:
+            hostname = urlparse.urlsplit(handler.path).netloc.rsplit(':', 1)[0].strip('[]')
+            if self.is_direct_regions(handler, hostname):
+                return [handler.do_METHOD_URLFETCH, None]
+
+
+class GAEFetchFilter(SimpleProxyHandlerFilter):
+    """force https filter"""
+    def filter(self, handler):
+        if handler.command == 'CONNECT':
+            return [handler.do_METHOD_STRIPSSL]
+        else:
+            fetchserver = '%s://%s.appspot.com%s' % (common.GAE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
+            return [handler.do_METHOD_URLFETCH, fetchserver]
+
+
+class GAEProxyHandler2(AdvancedProxyHandler):
+    """GAE Proxy Handler 2"""
+    handler_filters = [WithGAEFilter(), FakeHttpsFilter(), ForceHttpsFilter(), HostsFilter(), DirectRegionFilter(), SimpleProxyHandlerFilter()]
+
+    def _create_http_request_withserver(self, fetchserver, method, url, headers, body, timeout, **kwargs):
+        # deflate = lambda x:zlib.compress(x)[2:-4]
+        rc4crypt = lambda s, k: RC4Cipher(k).encrypt(s) if k else s
+        if body:
+            if len(body) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
+                zbody = zlib.compress(body)[2:-4]
+                if len(zbody) < len(body):
+                    body = zbody
+                    headers['Content-Encoding'] = 'deflate'
+            headers['Content-Length'] = str(len(body))
+        # GAE donot allow set `Host` header
+        if 'Host' in headers:
+            del headers['Host']
+        metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
+        skip_headers = self.skip_headers
+        metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
+        # prepare GAE request
+        request_method = 'POST'
+        request_headers = {}
+        if common.GAE_OBFUSCATE:
+            if 'rc4' in common.GAE_OPTIONS:
+                request_headers['X-GOA-Options'] = 'rc4'
+                cookie = base64.b64encode(rc4crypt(zlib.compress(metadata)[2:-4], kwargs.get('password'))).strip()
+                body = rc4crypt(body, kwargs.get('password'))
+            else:
+                cookie = base64.b64encode(zlib.compress(metadata)[2:-4]).strip()
+            request_headers['Cookie'] = cookie
+            if body:
+                request_headers['Content-Length'] = str(len(body))
+            else:
+                request_method = 'GET'
+        else:
+            metadata = zlib.compress(metadata)[2:-4]
+            body = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, body)
+            if 'rc4' in common.GAE_OPTIONS:
+                request_headers['X-GOA-Options'] = 'rc4'
+                body = rc4crypt(body, kwargs.get('password'))
+            request_headers['Content-Length'] = str(len(body))
+        # post data
+        need_crlf = 0 if common.GAE_MODE == 'https' else 1
+        need_validate = common.GAE_VALIDATE
+        connection_cache_key = '%s:%d' % (common.HOSTS_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
+        response = self.create_http_request(request_method, fetchserver, request_headers, body, self.max_timeout, crlf=need_crlf, validate=need_validate, connection_cache_key=connection_cache_key)
+        response.app_status = response.status
+        response.app_options = response.getheader('X-GOA-Options', '')
+        if response.status != 200:
+            return response
+        data = response.read(4)
+        if len(data) < 4:
+            response.status = 502
+            response.fp = io.BytesIO(b'connection aborted. too short leadtype data=' + data)
+            response.read = response.fp.read
+            return response
+        response.status, headers_length = struct.unpack('!hh', data)
+        data = response.read(headers_length)
+        if len(data) < headers_length:
+            response.status = 502
+            response.fp = io.BytesIO(b'connection aborted. too short headers data=' + data)
+            response.read = response.fp.read
+            return response
+        if 'rc4' not in response.app_options:
+            response.msg = httplib.HTTPMessage(io.BytesIO(zlib.decompress(data, -zlib.MAX_WBITS)))
+        else:
+            response.msg = httplib.HTTPMessage(io.BytesIO(zlib.decompress(rc4crypt(data, kwargs.get('password')), -zlib.MAX_WBITS)))
+            if kwargs.get('password') and response.fp:
+                response.fp = RC4FileObject(response.fp, kwargs['password'])
+        return response
+
+
 def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     if payload:
         if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
@@ -3022,7 +3457,7 @@ def main():
         thread.start_new_thread(server.serve_forever, tuple())
 
     if False:
-        server = LocalProxyServer(('', 9001), SimpleProxyHandler)
+        server = LocalProxyServer(('', 9001), GAEProxyHandler2)
         thread.start_new_thread(server.serve_forever, tuple())
 
     if common.DNS_ENABLE:
