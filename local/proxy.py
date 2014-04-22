@@ -341,11 +341,7 @@ class CertUtil(object):
             except Exception as e:
                 logging.error('load_certificate(certfile=%r) failed:%s', certfile, e)
         if sys.platform.startswith('win'):
-            import ctypes, ctypes.wintypes
-            X509_ASN_ENCODING = 0x00000001
-            CERT_FIND_HASH = 0x10000
-            class CRYPT_HASH_BLOB(ctypes.Structure):
-                _fields_ = [('cbData', ctypes.wintypes.DWORD), ('pbData', ctypes.c_char_p)]
+            import ctypes
             with open(certfile, 'rb') as fp:
                 certdata = fp.read()
                 if certdata.startswith(b'-----'):
@@ -356,10 +352,14 @@ class CertUtil(object):
                 store_handle = crypt32.CertOpenStore(10, 0, 0, 0x4000 | 0x20000, b'ROOT'.decode())
                 if not store_handle:
                     return -1
-                crypt_hash = CRYPT_HASH_BLOB()
-                crypt_hash.cbData = 20
-                crypt_hash.pbData = ctypes.c_char_p(binascii.a2b_hex(sha1digest.replace(':', '')))
-                if crypt32.CertFindCertificateInStore(store_handle, X509_ASN_ENCODING, 0, CERT_FIND_HASH, ctypes.byref(crypt_hash), None):
+                X509_ASN_ENCODING = 0x00000001
+                CERT_FIND_HASH = 0x10000
+                class CRYPT_HASH_BLOB(ctypes.Structure):
+                    _fields_ = [('cbData', ctypes.c_ulong), ('pbData', ctypes.c_char_p)]
+                crypt_hash = CRYPT_HASH_BLOB(20, binascii.a2b_hex(sha1digest.replace(':', '')))
+                crypt_handle = crypt32.CertFindCertificateInStore(store_handle, X509_ASN_ENCODING, 0, CERT_FIND_HASH, ctypes.byref(crypt_hash), None)
+                if crypt_handle:
+                    crypt32.CertFreeCertificateContext(crypt_handle)
                     return 0
                 ret = crypt32.CertAddEncodedCertificateToStore(store_handle, 0x1, certdata, len(certdata), 4, None)
                 crypt32.CertCloseStore(store_handle, 0)
@@ -672,7 +672,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """SimpleProxyHandler for GoAgent 3.x"""
 
     protocol_version = 'HTTP/1.1'
-    ssl_version = ssl.PROTOCOL_SSLv23
+    ssl_version = ssl.PROTOCOL_TLSv1
     scheme = 'http'
     skip_headers = frozenset(['Vary', 'Via', 'X-Forwarded-For', 'Proxy-Authorization', 'Proxy-Connection', 'Upgrade', 'X-Chrome-Variations', 'Connection', 'Cache-Control'])
     bufsize = 256 * 1024
@@ -772,6 +772,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def create_http_request_withserver(self, fetchserver, method, url, headers, body, timeout, **kwargs):
         raise NotImplementedError
 
+    def handle_urlfetch_error(self, fetchserver, response):
+        pass
+
     def parse_header(self):
         if self.command == 'CONNECT':
             netloc = self.path
@@ -827,6 +830,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def MOCK(self, status, headers, content):
         """mock response"""
         logging.info('%s "MOCK %s %s %s" %d %d', self.address_string(), self.command, self.path, self.protocol_version, status, len(content))
+        headers = {k.title(): v for k, v in headers.items()}
+        if 'Transfer-Encoding' in headers:
+            del headers['Transfer-Encoding']
         if 'Content-Length' not in headers:
             headers['Content-Length'] = len(content)
         if 'Connection' not in headers:
@@ -933,6 +939,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             for key, value in response.getheaders():
                 self.send_header(key, value)
             self.end_headers()
+            if self.command == 'HEAD' or response.status in (204, 304):
+                response.close()
+                return
             need_chunked = 'Transfer-Encoding' in response_headers
             while True:
                 data = response.read(8192)
@@ -975,10 +984,18 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=self.connect_timeout, **kwargs)
                 # appid over qouta, switch to next appid
                 if response.app_status >= 500:
-                    if i < max_retry - 1:
+                    self.handle_urlfetch_error(fetchserver, response)
+                    if i == max_retry - 1:
+                        headers = dict(response.getheaders())
+                        content = response.read()
                         response.close()
-                        fetchserver = random.choice(fetchservers)
-                        logging.info('URLFETCH return %d, trying another fetchserver=%r', response.app_status, fetchserver)
+                        logging.warning('URLFETCH fetchserver=%r return %d, failed.', fetchserver, response.app_status)
+                        return self.MOCK(response.app_status, headers, content)
+                    else:
+                        response.close()
+                        if len(fetchservers) > 1:
+                            fetchserver = random.choice(fetchservers[1:])
+                        logging.info('URLFETCH return %d, trying next fetchserver=%r', response.app_status, fetchserver)
                         continue
                 # first response, has no retry.
                 if not headers_sent and not raw_response:
@@ -990,6 +1007,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self.send_header(key, value)
                     self.end_headers()
                     headers_sent = True
+                if self.command == 'HEAD' or response.status in (204, 304):
+                    response.close()
+                    return
                 content_length = int(response.getheader('Content-Length', 0))
                 content_range = response.getheader('Content-Range', '')
                 accept_ranges = response.getheader('Accept-Ranges', 'none')
@@ -1319,7 +1339,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                     return sock
                 elif i == 0:
                     # only output first error
-                    logging.warning('create_connection to %s return %r, try again.', addrs, sock)
+                    logging.warning('create_tcp_connection to %r with %s return %r, try again.', hostname, addrs, sock)
         if isinstance(sock, Exception):
             raise sock
 
@@ -1474,7 +1494,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                     return sock
                 elif i == 0:
                     # only output first error
-                    logging.warning('create_ssl_connection to %s return %r, try again.', addrs, sock)
+                    logging.warning('create_ssl_connection to %r with %s return %r, try again.', hostname, addrs, sock)
         if isinstance(sock, Exception):
             raise sock
 
@@ -2806,6 +2826,8 @@ def pre_start():
         logging.error('dnslib not found, please put dnslib-0.8.3.egg to %r!', os.path.dirname(os.path.abspath(__file__)))
         sys.exit(-1)
     if not common.DNS_ENABLE:
+        if not common.HTTP_DNS:
+            common.HTTP_DNS = common.DNS_SERVERS[:]
         for dnsservers_ref in (common.HTTP_DNS, common.DNS_SERVERS):
             any(dnsservers_ref.insert(0, x) for x in [y for y in get_dnsserver_list() if y not in dnsservers_ref])
         AdvancedProxyHandler.dns_servers = common.HTTP_DNS
