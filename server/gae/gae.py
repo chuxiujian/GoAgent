@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding:utf-8
 
-__version__ = '3.1.5'
+__version__ = '3.1.10'
 __password__ = 'pass-gfw'
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 __content_type__ = 'image/gif'
@@ -171,7 +171,8 @@ def application(environ, start_response):
 
     deadline = URLFETCH_TIMEOUT
     validate_certificate = bool(int(kwargs.get('validate', 0)))
-    accept_encoding = headers.get('Accept-Encoding', '')
+    # https://www.freebsdchina.org/forum/viewtopic.php?t=54269
+    accept_encoding = headers.get('Accept-Encoding', '') or headers.get('Bccept-Encoding', '')
     errors = []
     for i in xrange(int(kwargs.get('fetchmax', URLFETCH_MAX))):
         try:
@@ -223,7 +224,7 @@ def application(environ, start_response):
     data = response.content
     response_headers = response.headers
     content_type = response_headers.get('content-type', '')
-    if 'content-encoding' not in response_headers and 0 < len(response.content) < URLFETCH_DEFLATE_MAXSIZE and content_type.startswith(('text/', 'application/json', 'application/javascript')):
+    if 'content-encoding' not in response_headers and 512 < len(response.content) < URLFETCH_DEFLATE_MAXSIZE and content_type.startswith(('text/', 'application/json', 'application/javascript')):
         if 'gzip' in accept_encoding:
             response_headers['Content-Encoding'] = 'gzip'
             compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
@@ -236,8 +237,7 @@ def application(environ, start_response):
         elif 'deflate' in accept_encoding:
             response_headers['Content-Encoding'] = 'deflate'
             data = deflate(data)
-    if data:
-        response_headers['Content-Length'] = str(len(data))
+    response_headers['Content-Length'] = str(len(data))
     response_headers_data = deflate('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))
     if 'rc4' not in options or content_type.startswith(('audio/', 'image/', 'video/')):
         start_response('200 OK', [('Content-Type', __content_type__)])

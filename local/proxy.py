@@ -1006,11 +1006,11 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 content = message_html('502 URLFetch failed', 'Local URLFetch %r failed' % url, '<br>'.join(repr(x) for x in errors))
             return self.MOCK(status, headers, content)
         logging.info('%s "URL %s %s %s" %s %s', self.address_string(), method, url, self.protocol_version, response.status, response.getheader('Content-Length', '-'))
-        self.close_connection = True
         try:
             if response.status == 206:
                 return RangeFetch(self, response, fetchservers, **kwargs).fetch()
             if response.app_type == 'gae':
+                self.close_connection = not response.getheader('Content-Length')
                 self.send_response(response.status)
                 for key, value in response.getheaders():
                     if key.title() == 'Transfer-Encoding':
@@ -1891,15 +1891,8 @@ class WithGAEFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         if handler.host in common.HTTP_WITHGAE:
             logging.debug('WithGAEFilter metched %r %r', handler.path, handler.headers)
-            if handler.command == 'CONNECT':
-                return [handler.STRIPSSL, self]
-            kwargs = {}
-            if common.GAE_PASSWORD:
-                kwargs['password'] = common.GAE_PASSWORD
-            if common.GAE_VALIDATE:
-                kwargs['validate'] = 1
-            fetchservers = ['%s://%s.appspot.com%s' % (common.GAE_MODE, x, common.GAE_PATH) for x in common.GAE_APPIDS]
-            return [handler.URLFETCH, fetchservers, common.FETCHMAX_LOCAL, kwargs]
+            # assume the last one handler is GAEFetchFilter
+            return handler.handler_filters[-1].filter(handler)
 
 
 class ForceHttpsFilter(BaseProxyHandlerFilter):
@@ -1915,6 +1908,7 @@ class FakeHttpsFilter(BaseProxyHandlerFilter):
     """fake https filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT' and handler.host in common.HTTP_FAKEHTTPS:
+            logging.debug('FakeHttpsFilter metched %r %r', handler.path, handler.headers)
             return [handler.STRIPSSL, None]
 
 
@@ -1988,7 +1982,8 @@ class DirectRegionFilter(BaseProxyHandlerFilter):
             pass
         try:
             country_code = self.geoip.country_code_by_addr(socket.gethostbyname(hostname))
-        except Exception:
+        except Exception as e:
+            logging.warning('DirectRegionFilter cannot determine region for hostname=%r %r', hostname, e)
             country_code = ''
         self.region_cache[hostname] = country_code
         return country_code
@@ -2027,7 +2022,9 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         if handler.command == 'CONNECT':
             return [handler.STRIPSSL, self if not common.URLRE_MAP else None]
-        elif handler.command == 'OPTIONS':
+        elif handler.command in ('OPTIONS',):
+            # if common.PHP_ENABLE:
+            #     return PHPProxyHandler.handler_filters[-1].filter(handler)
             return [handler.DIRECT, {}]
         else:
             kwargs = {}
