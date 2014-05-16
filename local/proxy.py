@@ -1025,6 +1025,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def handle_urlfetch_error(self, fetchserver, response):
         pass
 
+    def handle_urlfetch_response_close(self, fetchserver, response):
+        pass
+
     def parse_header(self):
         if self.command == 'CONNECT':
             netloc = self.path
@@ -1273,6 +1276,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if data:
                     self.wfile.write(data)
                 if not data:
+                    self.handle_urlfetch_response_close(fetchserver, response)
                     response.close()
                     break
                 del data
@@ -1812,7 +1816,22 @@ class AdvancedProxyHandler(SimpleProxyHandler):
             return None
         response = httplib.HTTPResponse(sock, buffering=True)
         response.begin()
+        if cache_key:
+            response.cache_key = cache_key
+            response.cache_sock = response.fp._sock
         return response
+
+    def handle_urlfetch_response_close(self, fetchserver, response):
+        cache_sock = getattr(response, 'cache_sock', None)
+        if cache_sock:
+            if self.scheme == 'https':
+                self.ssl_connection_cache[response.cache_key].put((time.time(), cache_sock))
+            else:
+                cache_sock.close()
+            del response.cache_sock
+
+    def handle_urlfetch_error(self, fetchserver, response):
+        pass
 
 
 class Common(object):
