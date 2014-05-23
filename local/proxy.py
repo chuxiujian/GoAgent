@@ -41,7 +41,7 @@
 #      v3aqb             <sgzz.cj@gmail.com>
 #      Oling Cat         <olingcat@gmail.com>
 
-__version__ = '3.1.11'
+__version__ = '3.1.12'
 
 import sys
 import os
@@ -559,15 +559,26 @@ class ProxyUtil(object):
         return listen_ip
 
 
-def dnslib_resolve_over_udp(qname, dnsservers, timeout, **kwargs):
+def parse_hostport(host, default_port=80):
+    m = re.match(r'(.+)[#](\d+)$', host)
+    if m:
+        return m.group(1).strip('[]'), int(m.group(2))
+    else:
+        return host.strip('[]'), default_port
+
+
+def dnslib_resolve_over_udp(query, dnsservers, timeout, **kwargs):
     """
     http://gfwrev.blogspot.com/2009/11/gfwdns.html
     http://zh.wikipedia.org/wiki/%E5%9F%9F%E5%90%8D%E6%9C%8D%E5%8A%A1%E5%99%A8%E7%BC%93%E5%AD%98%E6%B1%A1%E6%9F%93
     http://support.microsoft.com/kb/241352
     """
+    if not isinstance(query, (basestring, dnslib.DNSRecord)):
+        raise TypeError('query argument requires string/DNSRecord')
+    if isinstance(query, basestring):
+        query = dnslib.DNSRecord(q=dnslib.DNSQuestion(query))
     blacklist = kwargs.get('blacklist', ())
     turstservers = kwargs.get('turstservers', ())
-    query = dnslib.DNSRecord(q=dnslib.DNSQuestion(qname))
     query_data = query.pack()
     dns_v4_servers = [x for x in dnsservers if ':' not in x]
     dns_v6_servers = [x for x in dnsservers if ':' in x]
@@ -584,64 +595,65 @@ def dnslib_resolve_over_udp(qname, dnsservers, timeout, **kwargs):
         for _ in xrange(4):
             try:
                 for dnsserver in dns_v4_servers:
-                    sock_v4.sendto(query_data, (dnsserver, 53))
+                    sock_v4.sendto(query_data, parse_hostport(dnsserver, 53))
                 for dnsserver in dns_v6_servers:
-                    sock_v6.sendto(query_data, (dnsserver, 53))
+                    sock_v6.sendto(query_data, parse_hostport(dnsserver, 53))
                 while time.time() < timeout_at:
                     ins, _, _ = select.select(socks, [], [], 0.1)
                     for sock in ins:
                         reply_data, (reply_server, _) = sock.recvfrom(512)
                         record = dnslib.DNSRecord.parse(reply_data)
-                        rtypes = (1, 28) if sock is sock_v6 else (1,)
-                        iplist = [str(x.rdata) for x in record.rr if x.rtype in rtypes]
+                        iplist = [str(x.rdata) for x in record.rr if x.rtype in (1, 28, 255)]
                         if any(x in blacklist for x in iplist):
-                            logging.warning('query qname=%r dnsservers=%r record bad iplist=%r', qname, dnsservers, iplist)
+                            logging.warning('query=%r dnsservers=%r record bad iplist=%r', query, dnsservers, iplist)
                         elif record.header.rcode and not iplist and reply_server in turstservers:
-                            logging.info('query qname=%r trust reply_server=%r record rcode=%s', qname, reply_server, record.header.rcode)
+                            logging.info('query=%r trust reply_server=%r record rcode=%s', query, reply_server, record.header.rcode)
                             return record
                         elif iplist:
-                            logging.debug('query qname=%r reply_server=%r record iplist=%s', qname, reply_server, iplist)
+                            logging.debug('query=%r reply_server=%r record iplist=%s', query, reply_server, iplist)
                             return record
                         else:
-                            logging.debug('query qname=%r reply_server=%r record null iplist=%s', qname, reply_server, iplist)
+                            logging.debug('query=%r reply_server=%r record null iplist=%s', query, reply_server, iplist)
                             continue
             except socket.error as e:
                 logging.warning('handle dns query=%s socket: %r', query, e)
-        raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (qname, dnsservers))
+        raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsservers))
     finally:
         for sock in socks:
             sock.close()
 
 
-def dnslib_resolve_over_tcp(qname, dnsservers, timeout, **kwargs):
+def dnslib_resolve_over_tcp(query, dnsservers, timeout, **kwargs):
     """dns query over tcp"""
+    if not isinstance(query, (basestring, dnslib.DNSRecord)):
+        raise TypeError('query argument requires string/DNSRecord')
+    if isinstance(query, basestring):
+        query = dnslib.DNSRecord(q=dnslib.DNSQuestion(query))
     blacklist = kwargs.get('blacklist', ())
-    def do_resolve(qname, dnsserver, timeout, queobj):
-        query = dnslib.DNSRecord(q=dnslib.DNSQuestion(qname))
+    def do_resolve(query, dnsserver, timeout, queobj):
         query_data = query.pack()
         sock_family = socket.AF_INET6 if ':' in dnsserver else socket.AF_INET
         sock = socket.socket(sock_family)
         rfile = None
         try:
             sock.settimeout(timeout or None)
-            sock.connect((dnsserver, 53))
+            sock.connect(parse_hostport(dnsserver, 53))
             sock.send(struct.pack('>h', len(query_data)) + query_data)
             rfile = sock.makefile('r', 1024)
             reply_data_length = rfile.read(2)
             if len(reply_data_length) < 2:
-                raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (qname, dnsserver))
+                raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsserver))
             reply_data = rfile.read(struct.unpack('>h', reply_data_length)[0])
             record = dnslib.DNSRecord.parse(reply_data)
-            rtypes = (1, 28) if sock_family is socket.AF_INET6 else (1,)
-            iplist = [str(x.rdata) for x in record.rr if x.rtype in rtypes]
+            iplist = [str(x.rdata) for x in record.rr if x.rtype in (1, 28, 255)]
             if any(x in blacklist for x in iplist):
-                logging.debug('query qname=%r dnsserver=%r record bad iplist=%r', qname, dnsserver, iplist)
-                raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (qname, dnsserver))
+                logging.debug('query=%r dnsserver=%r record bad iplist=%r', query, dnsserver, iplist)
+                raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsserver))
             else:
-                logging.debug('query qname=%r dnsserver=%r record iplist=%s', qname, dnsserver, iplist)
+                logging.debug('query=%r dnsserver=%r record iplist=%s', query, dnsserver, iplist)
                 queobj.put(record)
         except socket.error as e:
-            logging.debug('query qname=%r dnsserver=%r failed %r', qname, dnsserver, e)
+            logging.debug('query=%r dnsserver=%r failed %r', query, dnsserver, e)
             queobj.put(e)
         finally:
             if rfile:
@@ -649,23 +661,24 @@ def dnslib_resolve_over_tcp(qname, dnsservers, timeout, **kwargs):
             sock.close()
     queobj = Queue.Queue()
     for dnsserver in dnsservers:
-        thread.start_new_thread(do_resolve, (qname, dnsserver, timeout, queobj))
+        thread.start_new_thread(do_resolve, (query, dnsserver, timeout, queobj))
     for i in range(len(dnsservers)):
         try:
             result = queobj.get(timeout)
         except Queue.Empty:
-            raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (qname, dnsservers))
+            raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsservers))
         if result and not isinstance(result, Exception):
             return result
         elif i == len(dnsservers) - 1:
-            logging.warning('dnslib_resolve_over_tcp %r with %s return %r', qname, dnsservers, result)
-    raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (qname, dnsservers))
+            logging.warning('dnslib_resolve_over_tcp %r with %s return %r', query, dnsservers, result)
+    raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsservers))
 
 
 def dnslib_record2iplist(record):
     """convert dnslib.DNSRecord to iplist"""
     assert isinstance(record, dnslib.DNSRecord)
-    return [str(x.rdata) for x in record.rr if x.rtype in (1, 28)]
+    iplist = [x for x in (str(r.rdata) for r in record.rr) if re.match(r'^\d+\.\d+\.\d+\.\d+$', x) or ':' in x]
+    return iplist
 
 
 def get_dnsserver_list():
@@ -674,12 +687,9 @@ def get_dnsserver_list():
         DNS_CONFIG_DNS_SERVER_LIST = 6
         buf = ctypes.create_string_buffer(2048)
         ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
-        ips = struct.unpack('I', buf[0:4])[0]
-        out = []
-        for i in xrange(ips):
-            start = (i+1) * 4
-            out.append(socket.inet_ntoa(buf[start:start+4]))
-        return out
+        ipcount = struct.unpack('I', buf[0:4])[0]
+        iplist = [socket.inet_ntoa(buf[i:i+4]) for i in xrange(4, ipcount*4+4, 4)]
+        return iplist
     elif os.path.isfile('/etc/resolv.conf'):
         with open('/etc/resolv.conf', 'rb') as fp:
             return re.findall(r'(?m)^nameserver\s+(\S+)', fp.read())
@@ -1172,6 +1182,10 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
             remote.settimeout(None)
         del kwargs
+        data = data_is_clienthello and getattr(remote, 'data', None)
+        if data:
+            del remote.data
+            local.sendall(data)
         self.forward_socket(local, remote, self.max_timeout)
 
     def DIRECT(self, kwargs):
@@ -1517,13 +1531,15 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # send client hello and peek server hello
                 if client_hello:
                     sock.sendall(client_hello)
-                    if hasattr(socket, 'MSG_PEEK'):
-                        peek_data = sock.recv(1, socket.MSG_PEEK)
-                        if not peek_data:
-                            logging.debug('create_tcp_connection %r with client_hello return NULL byte, continue %r', ipaddr, time.time()-start_time)
-                            raise socket.timeout('timed out')
-                        # record TCP connection time with client hello
-                        self.tcp_connection_time_with_clienthello[ipaddr] = time.time() - start_time
+                    if gevent and isinstance(sock, gevent.socket.socket):
+                        sock.data = data = sock.recv(4096)
+                    else:
+                        data = sock.recv(4096, socket.MSG_PEEK)
+                    if not data:
+                        logging.debug('create_tcp_connection %r with client_hello return NULL byte, continue %r', ipaddr, time.time()-start_time)
+                        raise socket.timeout('timed out')
+                    # record TCP connection time with client hello
+                    self.tcp_connection_time_with_clienthello[ipaddr] = time.time() - start_time
                 # put tcp socket object to output queobj
                 queobj.put(sock)
             except (socket.error, OSError) as e:
@@ -2024,7 +2040,6 @@ class Common(object):
         info += 'GAE Obfuscate      : %s\n' % self.GAE_OBFUSCATE if self.GAE_OBFUSCATE else ''
         if common.PAC_ENABLE:
             info += 'Pac Server         : http://%s:%d/%s\n' % (self.PAC_IP if self.PAC_IP and self.PAC_IP != '0.0.0.0' else ProxyUtil.get_listen_ip(), self.PAC_PORT, self.PAC_FILE)
-            info += 'Pac File           : file://%s\n' % os.path.join(os.path.dirname(os.path.abspath(__file__)), self.PAC_FILE).replace('\\', '/')
         if common.PHP_ENABLE:
             info += 'PHP Listen         : %s\n' % common.PHP_LISTEN
             info += 'PHP FetchServer    : %s\n' % common.PHP_FETCHSERVER
@@ -2055,7 +2070,7 @@ def message_html(title, banner, detail=''):
     </head>
     <body text=#000000 bgcolor=#ffffff>
     <table border=0 cellpadding=2 cellspacing=0 width=100%>
-    <tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message</b></td></tr>
+    <tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message From LocalProxy</b></td></tr>
     <tr><td> </td></tr></table>
     <blockquote>
     <H1>$banner</H1>
