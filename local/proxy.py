@@ -253,7 +253,7 @@ class CertUtil(object):
         ca.set_pubkey(key)
         ca.add_extensions([
             OpenSSL.crypto.X509Extension(b'basicConstraints', True, b'CA:TRUE'),
-            OpenSSL.crypto.X509Extension(b'nsCertType', True, b'sslCA'),
+            # OpenSSL.crypto.X509Extension(b'nsCertType', True, b'sslCA'),
             OpenSSL.crypto.X509Extension(b'extendedKeyUsage', True, b'serverAuth,clientAuth,emailProtection,timeStamping,msCodeInd,msCodeCom,msCTLSign,msSGC,msEFS,nsSGC'),
             OpenSSL.crypto.X509Extension(b'keyUsage', False, b'keyCertSign, cRLSign'),
             OpenSSL.crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=ca), ])
@@ -420,7 +420,7 @@ class CertUtil(object):
 
 class DetectMobileBrowser:
     """detect mobile function from http://detectmobilebrowsers.com"""
-    regex_match_a  = re.compile(r"(android|bb\\d+|meego).+mobile|avantgo|bada\\/|blackberry|blazer|compal|elaine|fennec|hiptop|iemobile|ip(hone|od)|iris|kindle|lge |maemo|midp|mmp|mobile.+firefox|netfront|opera m(ob|in)i|palm( os)?|phone|p(ixi|re)\\/|plucker|pocket|psp|series(4|6)0|symbian|treo|up\\.(browser|link)|vodafone|wap|windows (ce|phone)|xda|xiino", re.I|re.M).search
+    regex_match_a = re.compile(r"(android|bb\\d+|meego).+mobile|avantgo|bada\\/|blackberry|blazer|compal|elaine|fennec|hiptop|iemobile|ip(hone|od)|iris|kindle|lge |maemo|midp|mmp|mobile.+firefox|netfront|opera m(ob|in)i|palm( os)?|phone|p(ixi|re)\\/|plucker|pocket|psp|series(4|6)0|symbian|treo|up\\.(browser|link)|vodafone|wap|windows (ce|phone)|xda|xiino", re.I|re.M).search
     regex_match_b = re.compile(r"1207|6310|6590|3gso|4thp|50[1-6]i|770s|802s|a wa|abac|ac(er|oo|s\\-)|ai(ko|rn)|al(av|ca|co)|amoi|an(ex|ny|yw)|aptu|ar(ch|go)|as(te|us)|attw|au(di|\\-m|r |s )|avan|be(ck|ll|nq)|bi(lb|rd)|bl(ac|az)|br(e|v)w|bumb|bw\\-(n|u)|c55\\/|capi|ccwa|cdm\\-|cell|chtm|cldc|cmd\\-|co(mp|nd)|craw|da(it|ll|ng)|dbte|dc\\-s|devi|dica|dmob|do(c|p)o|ds(12|\\-d)|el(49|ai)|em(l2|ul)|er(ic|k0)|esl8|ez([4-7]0|os|wa|ze)|fetc|fly(\\-|_)|g1 u|g560|gene|gf\\-5|g\\-mo|go(\\.w|od)|gr(ad|un)|haie|hcit|hd\\-(m|p|t)|hei\\-|hi(pt|ta)|hp( i|ip)|hs\\-c|ht(c(\\-| |_|a|g|p|s|t)|tp)|hu(aw|tc)|i\\-(20|go|ma)|i230|iac( |\\-|\\/)|ibro|idea|ig01|ikom|im1k|inno|ipaq|iris|ja(t|v)a|jbro|jemu|jigs|kddi|keji|kgt( |\\/)|klon|kpt |kwc\\-|kyo(c|k)|le(no|xi)|lg( g|\\/(k|l|u)|50|54|\\-[a-w])|libw|lynx|m1\\-w|m3ga|m50\\/|ma(te|ui|xo)|mc(01|21|ca)|m\\-cr|me(rc|ri)|mi(o8|oa|ts)|mmef|mo(01|02|bi|de|do|t(\\-| |o|v)|zz)|mt(50|p1|v )|mwbp|mywa|n10[0-2]|n20[2-3]|n30(0|2)|n50(0|2|5)|n7(0(0|1)|10)|ne((c|m)\\-|on|tf|wf|wg|wt)|nok(6|i)|nzph|o2im|op(ti|wv)|oran|owg1|p800|pan(a|d|t)|pdxg|pg(13|\\-([1-8]|c))|phil|pire|pl(ay|uc)|pn\\-2|po(ck|rt|se)|prox|psio|pt\\-g|qa\\-a|qc(07|12|21|32|60|\\-[2-7]|i\\-)|qtek|r380|r600|raks|rim9|ro(ve|zo)|s55\\/|sa(ge|ma|mm|ms|ny|va)|sc(01|h\\-|oo|p\\-)|sdk\\/|se(c(\\-|0|1)|47|mc|nd|ri)|sgh\\-|shar|sie(\\-|m)|sk\\-0|sl(45|id)|sm(al|ar|b3|it|t5)|so(ft|ny)|sp(01|h\\-|v\\-|v )|sy(01|mb)|t2(18|50)|t6(00|10|18)|ta(gt|lk)|tcl\\-|tdg\\-|tel(i|m)|tim\\-|t\\-mo|to(pl|sh)|ts(70|m\\-|m3|m5)|tx\\-9|up(\\.b|g1|si)|utst|v400|v750|veri|vi(rg|te)|vk(40|5[0-3]|\\-v)|vm40|voda|vulc|vx(52|53|60|61|70|80|81|83|85|98)|w3c(\\-| )|webc|whit|wi(g |nc|nw)|wmlb|wonu|x700|yas\\-|your|zeto|zte\\-", re.I|re.M).search
 
     @staticmethod
@@ -441,7 +441,7 @@ class SSLConnection(object):
         if attr not in ('_context', '_sock', '_connection', '_makefile_refs'):
             return getattr(self._connection, attr)
 
-    def __wait_sock_io(self, sock, io_func, *args, **kwargs):
+    def __wait_sock_io(self, io_func, *args, **kwargs):
         timeout = self._sock.gettimeout() or 0.1
         fd = self._sock.fileno()
         while True:
@@ -464,14 +464,14 @@ class SSLConnection(object):
         return client, addr
 
     def do_handshake(self):
-        return self.__wait_sock_io(self._sock, self._connection.do_handshake)
+        return self.__wait_sock_io(self._connection.do_handshake)
 
     def connect(self, *args, **kwargs):
-        return self.__wait_sock_io(self._sock, self._connection.connect, *args, **kwargs)
+        return self.__wait_sock_io(self._connection.connect, *args, **kwargs)
 
     def send(self, data, flags=0):
         try:
-            return self.__wait_sock_io(self._sock, self._connection.send, data, flags)
+            return self.__wait_sock_io(self._connection.send, data, flags)
         except OpenSSL.SSL.SysCallError as e:
             if e[0] == -1 and not data:
                 # errors when writing empty strings are expected and can be ignored
@@ -483,7 +483,7 @@ class SSLConnection(object):
         if pending:
             return self._connection.recv(min(pending, bufsiz))
         try:
-            return self.__wait_sock_io(self._sock, self._connection.recv, bufsiz, flags)
+            return self.__wait_sock_io(self._connection.recv, bufsiz, flags)
         except OpenSSL.SSL.ZeroReturnError:
             return ''
 
@@ -685,7 +685,8 @@ def dnslib_record2iplist(record):
 
 def get_dnsserver_list():
     if os.name == 'nt':
-        import ctypes, ctypes.wintypes, struct, socket
+        import ctypes
+        import ctypes.wintypes
         DNS_CONFIG_DNS_SERVER_LIST = 6
         buf = ctypes.create_string_buffer(2048)
         ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
@@ -744,7 +745,7 @@ def extract_sni_name(packet):
         cipher_suites_length, = struct.unpack('>h', stream.read(2))
         stream.read(cipher_suites_length+2)
         extensions_length, = struct.unpack('>h', stream.read(2))
-        extensions = {}
+        # extensions = {}
         while True:
             data = stream.read(2)
             if not data:
@@ -1707,7 +1708,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # set a short timeout to trigger timeout retry more quickly.
                 sock.settimeout(timeout or self.connect_timeout)
                 # pick up the certificate
-                server_hostname = b'mail.google.com' if cache_key.startswith('google_') or hostname.endswith('.appspot.com') else None
+                server_hostname = b'www.googleapis.com' if cache_key.startswith('google_') or hostname.endswith('.appspot.com') else None
                 ssl_sock = SSLConnection(self.openssl_context, sock)
                 ssl_sock.set_connect_state()
                 if server_hostname and hasattr(ssl_sock, 'set_tlsext_host_name'):
@@ -1809,7 +1810,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
             remain_window = 3 * window - len(addrs)
             if 0 < remain_window <= len(addresses):
                 addrs += random.sample(addresses, remain_window)
-            logging.debug('%s good_ipaddrs=%d, unkown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unkown_ipaddrs),  len(bad_ipaddrs))
+            logging.debug('%s good_ipaddrs=%d, unkown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unkown_ipaddrs), len(bad_ipaddrs))
             queobj = gevent.queue.Queue() if gevent else Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
@@ -2076,7 +2077,7 @@ class Common(object):
                     iplist = dnslib_record2iplist(dnslib_resolve(host, [dnsserver], timeout=4, blacklist=self.DNS_BLACKLIST))
                     queue.put((host, dnsserver, iplist))
                 except (socket.error, OSError) as e:
-                    logging.warning('%r remote host=%r failed: %s', dnslib_resolve.func_name, host, e)
+                    logging.warning('%r remote host=%r failed: %s', dnslib_resolve, host, e)
                     time.sleep(1)
         result_queue = Queue.Queue()
         for host in hosts:
@@ -2133,7 +2134,7 @@ class Common(object):
                 resolved_iplist = list(set(resolved_iplist))
             if name.startswith('google_'):
                 resolved_iplist = list(set(resolved_iplist) - set(google_blacklist))
-            if len(resolved_iplist) == 0:
+            if len(resolved_iplist) == 0 and name in ('google_hk', 'google_cn'):
                 logging.error('resolve %s host return empty! please retry!', name)
                 sys.exit(-1)
             logging.info('resolve name=%s host to iplist=%r', name, resolved_iplist)
@@ -2288,15 +2289,20 @@ class LocalProxyServer(SocketServer.ThreadingTCPServer):
 
 class UserAgentFilter(BaseProxyHandlerFilter):
     """user agent filter"""
+    def __init__(self, user_agent):
+        self.user_agent = user_agent
+
     def filter(self, handler):
-        if common.USERAGENT_ENABLE:
-            handler.headers['User-Agent'] = common.USERAGENT_STRING
+        handler.headers['User-Agent'] = self.user_agent
 
 
 class WithGAEFilter(BaseProxyHandlerFilter):
     """with gae filter"""
+    def __init__(self, withgae_sites):
+        self.withgae_sites = set(withgae_sites)
+
     def filter(self, handler):
-        if handler.host in common.HTTP_WITHGAE:
+        if handler.host in self.withgae_sites:
             logging.debug('WithGAEFilter metched %r %r', handler.path, handler.headers)
             # assume the last one handler is GAEFetchFilter
             return handler.handler_filters[-1].filter(handler)
@@ -2304,8 +2310,12 @@ class WithGAEFilter(BaseProxyHandlerFilter):
 
 class ForceHttpsFilter(BaseProxyHandlerFilter):
     """force https filter"""
+    def __init__(self, forcehttps_sites, noforcehttps_sites):
+        self.forcehttps_sites = tuple(forcehttps_sites)
+        self.noforcehttps_sites = set(noforcehttps_sites)
+
     def filter(self, handler):
-        if handler.command != 'CONNECT' and handler.host.endswith(common.HTTP_FORCEHTTPS) and handler.host not in common.HTTP_NOFORCEHTTPS:
+        if handler.command != 'CONNECT' and handler.host.endswith(self.forcehttps_sites) and handler.host not in self.noforcehttps_sites:
             if not handler.headers.get('Referer', '').startswith('https://') and not handler.path.startswith('https://'):
                 logging.debug('ForceHttpsFilter metched %r %r', handler.path, handler.headers)
                 headers = {'Location': handler.path.replace('http://', 'https://', 1), 'Connection': 'close'}
@@ -2314,10 +2324,31 @@ class ForceHttpsFilter(BaseProxyHandlerFilter):
 
 class FakeHttpsFilter(BaseProxyHandlerFilter):
     """fake https filter"""
+    def __init__(self, fakehttps_sites, nofakehttps_sites):
+        self.fakehttps_sites = tuple(fakehttps_sites)
+        self.nofakehttps_sites = set(nofakehttps_sites)
+
     def filter(self, handler):
-        if handler.command == 'CONNECT' and handler.host.endswith(common.HTTP_FAKEHTTPS) and handler.host not in common.HTTP_NOFAKEHTTPS:
+        if handler.command == 'CONNECT' and handler.host.endswith(self.fakehttps_sites) and handler.host not in self.nofakehttps_sites:
             logging.debug('FakeHttpsFilter metched %r %r', handler.path, handler.headers)
             return [handler.STRIP, True, None]
+
+
+
+class URLRewriteFilter(BaseProxyHandlerFilter):
+    """url rewrite filter"""
+    rules = {
+                'www.google.com': (r'^https?://www\.google\.com/url\?.*url=([^&]+)', lambda m: urllib.unquote_plus(m.group(1))),
+                'www.google.com.hk': (r'^https?://www\.google\.com\.hk/url\?.*url=([^&]+)', lambda m: urllib.unquote_plus(m.group(1))),
+            }
+    def filter(self, handler):
+        if handler.host in self.rules:
+            pattern, callback = self.rules[handler.host]
+            m = re.search(pattern, handler.path)
+            if m:
+                logging.debug('URLRewriteFilter metched %r', handler.path)
+                headers = {'Location': callback(m), 'Connection': 'close'}
+                return [handler.MOCK, 301, headers, '']
 
 
 class HostsFilter(BaseProxyHandlerFilter):
@@ -2392,6 +2423,9 @@ class DirectRegionFilter(BaseProxyHandlerFilter):
     geoip = pygeoip.GeoIP(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeoIP.dat')) if pygeoip and common.GAE_REGIONS else None
     region_cache = LRUCache(16*1024)
 
+    def __init__(self, regions):
+        self.regions = set(regions)
+
     def get_country_code(self, hostname, dnsservers):
         """http://dev.maxmind.com/geoip/legacy/codes/iso3166/"""
         try:
@@ -2415,7 +2449,7 @@ class DirectRegionFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         if self.geoip:
             country_code = self.get_country_code(handler.host, handler.dns_servers)
-            if country_code in common.GAE_REGIONS:
+            if country_code in self.regions:
                 if handler.command == 'CONNECT':
                     return [handler.FORWARD, handler.host, handler.port, handler.connect_timeout]
                 else:
@@ -2466,7 +2500,7 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
 
 class GAEProxyHandler(AdvancedProxyHandler):
     """GAE Proxy Handler"""
-    handler_filters = [UserAgentFilter(), WithGAEFilter(), FakeHttpsFilter(), ForceHttpsFilter(), HostsFilter(), DirectRegionFilter(), AutoRangeFilter(), GAEFetchFilter()]
+    handler_filters = [GAEFetchFilter()]
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
@@ -2508,7 +2542,7 @@ class PHPFetchFilter(BaseProxyHandlerFilter):
 class PHPProxyHandler(AdvancedProxyHandler):
     """PHP Proxy Handler"""
     first_run_lock = threading.Lock()
-    handler_filters = [UserAgentFilter(), FakeHttpsFilter(), ForceHttpsFilter(), PHPFetchFilter()]
+    handler_filters = [PHPFetchFilter()]
 
     def first_run(self):
         if common.PHP_USEHOSTS:
@@ -3096,8 +3130,6 @@ class PACProxyHandler(SimpleProxyHandler):
 
 
 def get_process_list():
-    import os
-    import glob
     import ctypes
     import collections
     Process = collections.namedtuple('Process', 'pid name exe')
@@ -3222,7 +3254,26 @@ def pre_start():
     RangeFetch.maxsize = common.AUTORANGE_MAXSIZE
     RangeFetch.bufsize = common.AUTORANGE_BUFSIZE
     RangeFetch.waitsize = common.AUTORANGE_WAITSIZE
-    if common.LISTEN_USERNAME and common.LISTEN_PASSWORD:
+    if True:
+        GAEProxyHandler.handler_filters.insert(0, AutoRangeFilter())
+    if common.GAE_REGIONS:
+        GAEProxyHandler.handler_filters.insert(0, DirectRegionFilter(common.GAE_REGIONS))
+    if True:
+        GAEProxyHandler.handler_filters.insert(0, HostsFilter())
+    if True:
+        GAEProxyHandler.handler_filters.insert(0, URLRewriteFilter())
+    if common.HTTP_FAKEHTTPS:
+        GAEProxyHandler.handler_filters.insert(0, FakeHttpsFilter(common.HTTP_FAKEHTTPS, common.HTTP_NOFAKEHTTPS))
+        PHPProxyHandler.handler_filters.insert(0, FakeHttpsFilter(common.HTTP_FAKEHTTPS, common.HTTP_NOFAKEHTTPS))
+    if common.HTTP_FORCEHTTPS:
+        GAEProxyHandler.handler_filters.insert(0, ForceHttpsFilter(common.HTTP_FORCEHTTPS, common.HTTP_NOFORCEHTTPS))
+        PHPProxyHandler.handler_filters.insert(0, ForceHttpsFilter(common.HTTP_FORCEHTTPS, common.HTTP_NOFORCEHTTPS))
+    if common.HTTP_WITHGAE:
+        GAEProxyHandler.handler_filters.insert(0, WithGAEFilter(common.HTTP_WITHGAE))
+    if common.USERAGENT_ENABLE:
+        GAEProxyHandler.handler_filters.insert(0, UserAgentFilter(common.USERAGENT_STRING))
+        PHPProxyHandler.handler_filters.insert(0, UserAgentFilter(common.USERAGENT_STRING))
+    if common.LISTEN_USERNAME:
         GAEProxyHandler.handler_filters.insert(0, AuthFilter(common.LISTEN_USERNAME, common.LISTEN_PASSWORD))
 
 
