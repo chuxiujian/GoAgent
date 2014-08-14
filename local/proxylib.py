@@ -932,8 +932,6 @@ class StripPlugin(BaseFetchPlugin):
             except StandardError as e:
                 if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                     logging.exception('ssl.wrap_socket(connection=%r) failed: %s', handler.connection, e)
-                handler.connection.shutdown(socket.SHUT_RDWR)
-                handler.connection.close()
                 return
             handler.connection = ssl_sock
             handler.rfile = handler.connection.makefile('rb', handler.bufsize)
@@ -950,8 +948,6 @@ class StripPlugin(BaseFetchPlugin):
                 return
             if not handler.raw_requestline:
                 handler.close_connection = 1
-                handler.connection.shutdown(socket.SHUT_RDWR)
-                handler.connection.close()
                 return
             if not handler.parse_request():
                 handler.send_error(400)
@@ -960,8 +956,6 @@ class StripPlugin(BaseFetchPlugin):
         except NetWorkIOError as e:
             if e.args[0] in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
                 handler.close_connection = 1
-                handler.connection.shutdown(socket.SHUT_RDWR)
-                handler.connection.close()
                 return
             else:
                 raise
@@ -1522,8 +1516,8 @@ class MultipleConnectionMixin(object):
     max_window = 4
     connect_timeout = 4
     max_timeout = 8
-    ssl_version = ssl.PROTOCOL_TLSv1
-    openssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+    ssl_version = ssl.PROTOCOL_SSLv23
+    openssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.SSLv23_METHOD)
 
     def gethostbyname2(self, hostname):
         try:
@@ -1733,7 +1727,7 @@ class MultipleConnectionMixin(object):
                 # set a short timeout to trigger timeout retry more quickly.
                 sock.settimeout(timeout or self.connect_timeout)
                 # pick up the certificate
-                server_hostname = b'www.googleapis.com' if cache_key.startswith('google_') or hostname.endswith('.appspot.com') else None
+                server_hostname = b'www.googleapis.com' if (cache_key or '').startswith('google_') or hostname.endswith('.appspot.com') else None
                 ssl_sock = SSLConnection(self.openssl_context, sock)
                 ssl_sock.set_connect_state()
                 if server_hostname and hasattr(ssl_sock, 'set_tlsext_host_name'):
@@ -1813,7 +1807,7 @@ class MultipleConnectionMixin(object):
         try:
             while cache_key:
                 ctime, sock = self.ssl_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 30:
+                if time.time() - ctime < 8:
                     return sock
                 else:
                     sock.close()
