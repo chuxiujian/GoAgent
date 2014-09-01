@@ -13,15 +13,13 @@ function FindProxyForURL(url, host) {
                host == 'p.tanx.com' ||
                host == 'a.alimama.cn' ||
                host == 'pagead2.googlesyndication.com' ||
+               dnsDomainIs(host, '.google-analytics.com') ||
                dnsDomainIs(host, '.2mdn.net') ||
                dnsDomainIs(host, '.doubleclick.net')) {
         return blackhole;
     } else if (shExpMatch(host, '*.google*.*') ||
                dnsDomainIs(host, '.ggpht.com') ||
                dnsDomainIs(host, '.wikipedia.org') ||
-               dnsDomainIs(host, '.sourceforge.net') ||
-               dnsDomainIs(host, '.sf.net') ||
-               host == 'sourceforge.net' ||
                host == 'cdnjs.cloudflare.com' ||
                host == 'wp.me' ||
                host == 'po.st' ||
